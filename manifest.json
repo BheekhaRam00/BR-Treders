@@ -1,0 +1,21 @@
+{
+  "name": "BR Traders – Intraday Signals",
+  "short_name": "BR Traders",
+  "description": "Real-time intraday option buying signals for Nifty, BankNifty & Sensex",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#080c18",
+  "theme_color": "#0a0e1a",
+  "lang": "en-IN",
+  "scope": "/",
+  "icons": [
+    { "src": "/icon-96.png",  "sizes": "96x96",   "type": "image/png", "purpose": "any" },
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ],
+  "categories": ["finance"],
+  "screenshots": [],
+  "share_target": null,
+  "prefer_related_applications": false
+}

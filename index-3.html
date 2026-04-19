@@ -1,0 +1,1272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+<meta name="theme-color" content="#0a0e1a"/>
+<meta name="mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+<meta name="apple-mobile-web-app-title" content="BR Traders"/>
+<title>BR Traders – Intraday Signals</title>
+<link rel="manifest" href="manifest.json"/>
+<link rel="icon" href="icon-192.png"/>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;500;600;700&family=Space+Mono:wght@400;700&family=Exo+2:wght@300;400;600;800&display=swap" rel="stylesheet"/>
+
+<!-- Firebase -->
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, onAuthStateChanged, signOut }
+  from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+import { getFirestore, collection, addDoc, getDocs, query, orderBy, limit, onSnapshot, doc, setDoc, updateDoc, where, Timestamp }
+  from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+import { getMessaging, getToken, onMessage }
+  from "https://www.gstatic.com/firebasejs/10.12.2/firebase-messaging.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyDAGTXvnKIWSFVL3c5iMCKjrVivqGy9oCI",
+  authDomain: "painting-images.firebaseapp.com",
+  projectId: "painting-images",
+  storageBucket: "painting-images.firebasestorage.app",
+  messagingSenderId: "634391472131",
+  appId: "1:634391472131:web:a38a3835931fa786220636",
+  measurementId: "G-JCN45GCP98"
+};
+
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+
+// ─── IST Timestamp ───────────────────────────────────────────────
+function getISTTimestamp() {
+  return new Date().toLocaleString("en-IN", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false
+  });
+}
+function getISTDate() {
+  return new Date().toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata" });
+}
+
+// ─── Auth State ───────────────────────────────────────────────────
+let currentUser = null;
+let activeTrades = {};
+let signalUnsubscribe = null;
+
+onAuthStateChanged(auth, user => {
+  currentUser = user;
+  if (user) {
+    showApp();
+    startSignalEngine();
+    listenFirestoreSignals();
+    setupFCM();
+  } else {
+    showAuth();
+  }
+});
+
+// ─── FCM Setup ───────────────────────────────────────────────────
+async function setupFCM() {
+  try {
+    if ('serviceWorker' in navigator) {
+      const reg = await navigator.serviceWorker.register('/firebase-messaging-sw.js');
+      const messaging = getMessaging(app);
+      const token = await getToken(messaging, {
+        vapidKey: 'BDs314vPkLiOvO50jbTkhaYl-hzyYj-X5-3uI1b7t1LYZQ8VQrzgl6veSokXscirDLU1DAs1GJdx51JAp22IYSQ',
+        serviceWorkerRegistration: reg
+      });
+      if (token && currentUser) {
+        await setDoc(doc(db, "fcmTokens", currentUser.uid), {
+          token, uid: currentUser.uid, updatedAt: Timestamp.now()
+        });
+      }
+      onMessage(messaging, payload => {
+        showToast(`🔔 ${payload.notification?.title || 'New Signal'}: ${payload.notification?.body || ''}`);
+      });
+    }
+  } catch(e) { console.warn("FCM:", e.message); }
+}
+
+// ─── Market Data Pipeline ─────────────────────────────────────────
+const SYMBOLS = {
+  NIFTY:    { yfSymbol: "^NSEI",   display: "NIFTY 50" },
+  BANKNIFTY:{ yfSymbol: "^NSEBANK",display: "BANK NIFTY" },
+  SENSEX:   { yfSymbol: "^BSESN",  display: "SENSEX" }
+};
+
+// Staggered fetch queue to avoid rate limits
+let fetchQueue = [];
+let fetchRunning = false;
+
+function enqueueFetch(fn) {
+  return new Promise((resolve, reject) => {
+    fetchQueue.push({ fn, resolve, reject });
+    if (!fetchRunning) runQueue();
+  });
+}
+
+async function runQueue() {
+  fetchRunning = true;
+  while (fetchQueue.length) {
+    const { fn, resolve, reject } = fetchQueue.shift();
+    try { resolve(await fn()); }
+    catch(e) { reject(e); }
+    await sleep(400); // 400ms between calls – pipeline rate limiter
+  }
+  fetchRunning = false;
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// Yahoo Finance proxy via allorigins (CORS bypass, no API key needed)
+async function fetchOHLCV(yfSymbol, interval = "5m", range = "1d") {
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yfSymbol)}?interval=${interval}&range=${range}`;
+  const proxy = `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`;
+  const res = await fetch(proxy);
+  const outer = await res.json();
+  const data = JSON.parse(outer.contents);
+  const result = data?.chart?.result?.[0];
+  if (!result) throw new Error("No data for " + yfSymbol);
+  const ts = result.timestamp;
+  const q = result.indicators.quote[0];
+  return ts.map((t, i) => ({
+    time: t * 1000,
+    open: q.open[i], high: q.high[i],
+    low: q.low[i], close: q.close[i],
+    volume: q.volume[i]
+  })).filter(c => c.close != null);
+}
+
+// ─── Technical Analysis Engine ────────────────────────────────────
+function calcEMA(data, period) {
+  const k = 2 / (period + 1);
+  let ema = data[0];
+  return data.map(v => { ema = v * k + ema * (1 - k); return ema; });
+}
+
+function calcRSI(closes, period = 14) {
+  let gains = 0, losses = 0;
+  for (let i = 1; i <= period; i++) {
+    const d = closes[i] - closes[i - 1];
+    if (d > 0) gains += d; else losses -= d;
+  }
+  let avgGain = gains / period, avgLoss = losses / period;
+  const rsi = [50];
+  for (let i = period + 1; i < closes.length; i++) {
+    const d = closes[i] - closes[i - 1];
+    avgGain = (avgGain * (period - 1) + (d > 0 ? d : 0)) / period;
+    avgLoss = (avgLoss * (period - 1) + (d < 0 ? -d : 0)) / period;
+    rsi.push(avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss));
+  }
+  return rsi;
+}
+
+function calcATR(candles, period = 14) {
+  const tr = candles.map((c, i) => {
+    if (i === 0) return c.high - c.low;
+    const prev = candles[i - 1];
+    return Math.max(c.high - c.low, Math.abs(c.high - prev.close), Math.abs(c.low - prev.close));
+  });
+  let atr = tr.slice(0, period).reduce((a, b) => a + b) / period;
+  for (let i = period; i < tr.length; i++) atr = (atr * (period - 1) + tr[i]) / period;
+  return atr;
+}
+
+function detectSupportResistance(candles, lookback = 20) {
+  const recent = candles.slice(-lookback);
+  const highs = recent.map(c => c.high);
+  const lows = recent.map(c => c.low);
+  return {
+    resistance: Math.max(...highs.slice(0, -3)),
+    support: Math.min(...lows.slice(0, -3))
+  };
+}
+
+function isHammer(c) {
+  const body = Math.abs(c.close - c.open);
+  const lowerWick = Math.min(c.open, c.close) - c.low;
+  const upperWick = c.high - Math.max(c.open, c.close);
+  return lowerWick >= body * 2 && upperWick <= body * 0.5 && body > 0;
+}
+function isInvertedHammer(c) {
+  const body = Math.abs(c.close - c.open);
+  const upperWick = c.high - Math.max(c.open, c.close);
+  const lowerWick = Math.min(c.open, c.close) - c.low;
+  return upperWick >= body * 2 && lowerWick <= body * 0.5 && body > 0;
+}
+function isBullishEngulfing(prev, curr) {
+  return prev.close < prev.open && curr.close > curr.open
+    && curr.close > prev.open && curr.open < prev.close;
+}
+function isBearishEngulfing(prev, curr) {
+  return prev.close > prev.open && curr.close < curr.open
+    && curr.open > prev.close && curr.close < prev.open;
+}
+
+function detectMarketTrend(candles) {
+  const closes = candles.map(c => c.close);
+  const ema20 = calcEMA(closes, 20);
+  const ema50 = closes.length >= 50 ? calcEMA(closes, 50) : null;
+  const last = closes.length - 1;
+  const e20 = ema20[last];
+  const e50 = ema50 ? ema50[last] : e20 * 0.99;
+  const price = closes[last];
+  if (price > e20 && e20 > e50) return "UPTREND";
+  if (price < e20 && e20 < e50) return "DOWNTREND";
+  return "SIDEWAYS";
+}
+
+function detectVolatility(candles) {
+  const atr = calcATR(candles);
+  const price = candles[candles.length - 1].close;
+  const atrPct = (atr / price) * 100;
+  return atrPct > 0.3; // >0.3% ATR = sufficient volatility
+}
+
+function detectOISignal(candles) {
+  // OI proxy: volume trend in recent 3 candles
+  const vols = candles.slice(-5).map(c => c.volume);
+  const avgVol = vols.slice(0, 3).reduce((a, b) => a + b) / 3;
+  const lastVol = vols[vols.length - 1];
+  return lastVol > avgVol * 1.1; // 10% above average = positive OI signal
+}
+
+// ─── Signal Generation Engine ─────────────────────────────────────
+async function analyzeSymbol(sym, cfg) {
+  const candles = await fetchOHLCV(cfg.yfSymbol, "5m", "2d");
+  if (candles.length < 30) return null;
+
+  const closes = candles.map(c => c.close);
+  const trend = detectMarketTrend(candles);
+  if (trend === "SIDEWAYS") return null; // Rule: No sideways entry
+
+  const volatile = detectVolatility(candles);
+  if (!volatile) return null; // Rule: Need volatility
+
+  const oiPositive = detectOISignal(candles);
+  const { support, resistance } = detectSupportResistance(candles);
+  const atr = calcATR(candles);
+  const rsi = calcRSI(closes);
+  const lastRSI = rsi[rsi.length - 1];
+
+  const n = candles.length;
+  const curr = candles[n - 1];
+  const prev = candles[n - 2];
+  const price = curr.close;
+
+  const nearSupport = Math.abs(price - support) / price < 0.005; // within 0.5%
+  const nearResistance = Math.abs(price - resistance) / price < 0.005;
+  const priceAboveSwing = price > resistance * 0.998;
+  const priceBelowSwing = price < support * 1.002;
+
+  let signal = null;
+  let confidence = 0;
+  let reasons = [];
+
+  // ── CALL conditions ──
+  const callCond1 = nearSupport && (
+    (isHammer(curr) && curr.high > prev.high) ||
+    isBullishEngulfing(prev, curr)
+  ) && oiPositive;
+  const callCond2 = trend === "UPTREND" && priceAboveSwing &&
+    (isHammer(curr) || isBullishEngulfing(prev, curr)) && oiPositive;
+  const callCond3 = (nearSupport || priceAboveSwing) && lastRSI < 60 && lastRSI > 30;
+
+  if (callCond1 || callCond2) {
+    signal = "CALL";
+    confidence += callCond1 ? 35 : 0;
+    confidence += callCond2 ? 30 : 0;
+    confidence += callCond3 ? 15 : 0;
+    confidence += trend === "UPTREND" ? 15 : 0;
+    confidence += oiPositive ? 10 : 0;
+    if (callCond1) reasons.push("Support + Bullish Pattern");
+    if (callCond2) reasons.push("Above Swing High + Uptrend");
+    if (callCond3) reasons.push("RSI in Buy Zone");
+  }
+
+  // ── PUT conditions ──
+  const putCond1 = nearResistance && (
+    (isInvertedHammer(curr) && curr.low < prev.low) ||
+    isBearishEngulfing(prev, curr)
+  ) && oiPositive;
+  const putCond2 = trend === "DOWNTREND" && priceBelowSwing &&
+    (isInvertedHammer(curr) || isBearishEngulfing(prev, curr)) && oiPositive;
+  const putCond3 = (nearResistance || priceBelowSwing) && lastRSI > 40 && lastRSI < 70;
+
+  if ((putCond1 || putCond2) && !signal) {
+    signal = "PUT";
+    confidence += putCond1 ? 35 : 0;
+    confidence += putCond2 ? 30 : 0;
+    confidence += putCond3 ? 15 : 0;
+    confidence += trend === "DOWNTREND" ? 15 : 0;
+    confidence += oiPositive ? 10 : 0;
+    if (putCond1) reasons.push("Resistance + Bearish Pattern");
+    if (putCond2) reasons.push("Below Swing Low + Downtrend");
+    if (putCond3) reasons.push("RSI in Sell Zone");
+  }
+
+  if (!signal || confidence < 55) return null; // Quality filter: min 55% confidence
+
+  const slMultiplier = 1.5;
+  const tpMultiplier = signal === "CALL" ? 2.5 : 2.5;
+
+  const entry = price;
+  const sl = signal === "CALL"
+    ? parseFloat((entry - atr * slMultiplier).toFixed(2))
+    : parseFloat((entry + atr * slMultiplier).toFixed(2));
+  const tp = signal === "CALL"
+    ? parseFloat((entry + atr * tpMultiplier).toFixed(2))
+    : parseFloat((entry - atr * tpMultiplier).toFixed(2));
+
+  const rr = Math.abs(tp - entry) / Math.abs(sl - entry);
+  const winProb = Math.min(Math.round(confidence + (rr > 2 ? 5 : 0)), 92);
+
+  return {
+    symbol: sym,
+    displayName: cfg.display,
+    type: signal,
+    entry: parseFloat(entry.toFixed(2)),
+    sl,
+    tp,
+    currentPrice: parseFloat(price.toFixed(2)),
+    winProbability: winProb,
+    trend,
+    rsi: parseFloat(lastRSI.toFixed(1)),
+    atr: parseFloat(atr.toFixed(2)),
+    support: parseFloat(support.toFixed(2)),
+    resistance: parseFloat(resistance.toFixed(2)),
+    reasons: reasons.join(" | "),
+    timestamp: getISTTimestamp(),
+    date: getISTDate(),
+    status: "ACTIVE",
+    uid: currentUser?.uid
+  };
+}
+
+// ─── Exit Condition Checker ────────────────────────────────────────
+async function checkExitConditions(trade, candles) {
+  const n = candles.length;
+  const curr = candles[n - 1];
+  const prev = candles[n - 2];
+  const price = curr.close;
+  const closes = candles.map(c => c.close);
+  const rsi = calcRSI(closes);
+  const lastRSI = rsi[rsi.length - 1];
+  const trend = detectMarketTrend(candles);
+  const { support, resistance } = detectSupportResistance(candles);
+
+  let exitReason = null;
+
+  if (trade.type === "CALL") {
+    if (isBearishEngulfing(prev, curr) || isInvertedHammer(curr)) exitReason = "Bearish Reversal Pattern";
+    else if (Math.abs(price - resistance) / price < 0.003) exitReason = "Near Resistance";
+    else if (trend === "DOWNTREND") exitReason = "Trend Reversal";
+    else if (price <= trade.sl) exitReason = "SL Hit";
+    else if (price >= trade.tp) exitReason = "TP Hit";
+  } else {
+    if (isBullishEngulfing(prev, curr) || isHammer(curr)) exitReason = "Bullish Reversal Pattern";
+    else if (Math.abs(price - support) / price < 0.003) exitReason = "Near Support";
+    else if (trend === "UPTREND") exitReason = "Trend Reversal";
+    else if (price >= trade.sl) exitReason = "SL Hit";
+    else if (price <= trade.tp) exitReason = "TP Hit";
+  }
+
+  // Update win probability dynamically
+  let newWinProb = trade.winProbability;
+  if (trade.type === "CALL") {
+    const pnlPct = ((price - trade.entry) / trade.entry) * 100;
+    newWinProb = Math.max(20, Math.min(92, trade.winProbability + pnlPct * 3));
+  } else {
+    const pnlPct = ((trade.entry - price) / trade.entry) * 100;
+    newWinProb = Math.max(20, Math.min(92, trade.winProbability + pnlPct * 3));
+  }
+
+  return { exitReason, currentPrice: parseFloat(price.toFixed(2)), newWinProb: Math.round(newWinProb) };
+}
+
+// ─── Signal Engine Loop ────────────────────────────────────────────
+let engineRunning = false;
+let engineInterval = null;
+
+async function startSignalEngine() {
+  if (engineRunning) return;
+  engineRunning = true;
+  updateStatus("🔄 Engine Starting...");
+  await runEngineIteration();
+  engineInterval = setInterval(runEngineIteration, 5 * 60 * 1000); // every 5 min
+}
+
+async function runEngineIteration() {
+  if (!currentUser) return;
+  updateStatus("📡 Fetching Market Data...");
+
+  for (const [sym, cfg] of Object.entries(SYMBOLS)) {
+    try {
+      await enqueueFetch(async () => {
+        // Check exit for active trades first
+        if (activeTrades[sym]) {
+          const candles = await fetchOHLCV(cfg.yfSymbol, "5m", "2d");
+          const { exitReason, currentPrice, newWinProb } = await checkExitConditions(activeTrades[sym], candles);
+          if (exitReason) {
+            await exitTrade(sym, exitReason, currentPrice);
+          } else {
+            await updateActiveTrade(sym, currentPrice, newWinProb);
+          }
+          return;
+        }
+        // Generate new signal
+        const signal = await analyzeSymbol(sym, cfg);
+        if (signal) {
+          await saveSignalToFirestore(signal);
+          showToast(`🎯 ${signal.displayName} ${signal.type} @ ₹${signal.entry}`);
+        }
+      });
+    } catch (e) {
+      console.warn(`${sym} error:`, e.message);
+    }
+  }
+
+  updateStatus(`✅ Last Update: ${getISTTimestamp()}`);
+}
+
+async function saveSignalToFirestore(signal) {
+  const ref = await addDoc(collection(db, "signals"), {
+    ...signal, createdAt: Timestamp.now()
+  });
+  activeTrades[signal.symbol] = { ...signal, id: ref.id };
+  renderAll();
+}
+
+async function exitTrade(sym, reason, exitPrice) {
+  const trade = activeTrades[sym];
+  if (!trade || !trade.id) return;
+  const pnl = trade.type === "CALL"
+    ? parseFloat((exitPrice - trade.entry).toFixed(2))
+    : parseFloat((trade.entry - exitPrice).toFixed(2));
+  const result = pnl > 0 ? "WIN" : pnl < 0 ? "LOSS" : "BREAKEVEN";
+
+  await updateDoc(doc(db, "signals", trade.id), {
+    status: "EXITED",
+    exitPrice, exitReason: reason, result, pnl,
+    exitTimestamp: getISTTimestamp(),
+    exitDate: getISTDate(),
+    updatedAt: Timestamp.now()
+  });
+  delete activeTrades[sym];
+  renderAll();
+}
+
+async function updateActiveTrade(sym, currentPrice, newWinProb) {
+  const trade = activeTrades[sym];
+  if (!trade?.id) return;
+  activeTrades[sym] = { ...trade, currentPrice, winProbability: newWinProb };
+  await updateDoc(doc(db, "signals", trade.id), {
+    currentPrice, winProbability: newWinProb, updatedAt: Timestamp.now()
+  });
+  renderAll();
+}
+
+// ─── Firestore Live Listener ──────────────────────────────────────
+function listenFirestoreSignals() {
+  if (signalUnsubscribe) signalUnsubscribe();
+  const q = query(collection(db, "signals"), orderBy("createdAt", "desc"), limit(50));
+  signalUnsubscribe = onSnapshot(q, snapshot => {
+    const allSignals = snapshot.docs.map(d => ({ ...d.data(), id: d.id }));
+    activeTrades = {};
+    allSignals.filter(s => s.status === "ACTIVE" && s.uid === currentUser?.uid)
+      .forEach(s => { activeTrades[s.symbol] = s; });
+    renderAll(allSignals);
+  });
+}
+
+// ─── UI Rendering ─────────────────────────────────────────────────
+function renderAll(allSignals) {
+  if (!allSignals) {
+    // refresh from activeTrades only
+    renderActiveTrades(Object.values(activeTrades));
+    return;
+  }
+  const todayStr = getISTDate();
+  const mySignals = allSignals.filter(s => s.uid === currentUser?.uid);
+  const active = mySignals.filter(s => s.status === "ACTIVE");
+  const todayExited = mySignals.filter(s => s.status === "EXITED" && s.exitDate === todayStr);
+  const historyOld = mySignals.filter(s => s.status === "EXITED" && s.exitDate !== todayStr);
+
+  renderActiveTrades(active);
+  renderTodayExits(todayExited);
+  renderHistory(historyOld);
+}
+
+function renderActiveTrades(trades) {
+  const el = document.getElementById('active-trades');
+  if (!el) return;
+  if (!trades.length) {
+    el.innerHTML = `<div class="empty-state">
+      <div class="empty-icon">📊</div>
+      <p>Scanning markets for high-probability setups...</p>
+    </div>`;
+    return;
+  }
+  const calls = trades.filter(t => t.type === "CALL");
+  const puts = trades.filter(t => t.type === "PUT");
+  let html = '<div class="signal-row">';
+  html += renderSignalCards(calls, puts);
+  html += '</div>';
+  el.innerHTML = html;
+}
+
+function renderSignalCards(calls, puts) {
+  const maxLen = Math.max(calls.length, puts.length);
+  if (!maxLen) return '';
+  let html = '';
+  for (let i = 0; i < maxLen; i++) {
+    const call = calls[i];
+    const put = puts[i];
+    html += '<div class="signal-pair">';
+    html += call ? renderActiveCard(call) : '<div class="signal-placeholder"></div>';
+    html += put ? renderActiveCard(put) : '<div class="signal-placeholder"></div>';
+    html += '</div>';
+  }
+  return html;
+}
+
+function renderActiveCard(t) {
+  const cls = t.type === "CALL" ? "call-card" : "put-card";
+  const icon = t.type === "CALL" ? "▲" : "▼";
+  const pnl = t.type === "CALL"
+    ? ((t.currentPrice || t.entry) - t.entry).toFixed(2)
+    : (t.entry - (t.currentPrice || t.entry)).toFixed(2);
+  const pnlCls = pnl >= 0 ? "pnl-pos" : "pnl-neg";
+  const probColor = t.winProbability >= 75 ? "#00ff88" : t.winProbability >= 60 ? "#ffd700" : "#ff6b6b";
+
+  return `<div class="signal-card ${cls}">
+    <div class="card-header">
+      <span class="signal-badge">${icon} ${t.type}</span>
+      <span class="symbol-name">${t.displayName || t.symbol}</span>
+      <div class="live-dot"></div>
+    </div>
+    <div class="entry-price">₹${t.entry}</div>
+    <div class="win-prob" style="--prob-color:${probColor}">
+      <svg viewBox="0 0 36 36" class="prob-ring">
+        <circle cx="18" cy="18" r="15" fill="none" stroke="#1a2035" stroke-width="3"/>
+        <circle cx="18" cy="18" r="15" fill="none" stroke="${probColor}" stroke-width="3"
+          stroke-dasharray="${(t.winProbability/100)*94.2} 94.2"
+          stroke-linecap="round" transform="rotate(-90 18 18)"/>
+      </svg>
+      <span>${t.winProbability}%</span>
+    </div>
+    <div class="trade-meta">
+      <div class="meta-row"><span class="lbl">CMP</span><span class="val ${pnlCls}">₹${t.currentPrice || t.entry}</span></div>
+      <div class="meta-row"><span class="lbl">SL</span><span class="val sl-val">₹${t.sl}</span></div>
+      <div class="meta-row"><span class="lbl">TP</span><span class="val tp-val">₹${t.tp}</span></div>
+      <div class="meta-row"><span class="lbl">P&L</span><span class="val ${pnlCls}">${pnl >= 0 ? '+' : ''}${pnl}</span></div>
+    </div>
+    <div class="reason-tag">${t.reasons || t.trend}</div>
+    <div class="ts">${t.timestamp}</div>
+  </div>`;
+}
+
+function renderTodayExits(trades) {
+  const el = document.getElementById('today-exits');
+  if (!el) return;
+  if (!trades.length) {
+    el.innerHTML = `<div class="empty-state-sm">No exits today yet</div>`;
+    return;
+  }
+  const sorted = [...trades].sort((a, b) => (b.exitTimestamp || '').localeCompare(a.exitTimestamp || ''));
+  const calls = sorted.filter(t => t.type === "CALL");
+  const puts = sorted.filter(t => t.type === "PUT");
+  const maxLen = Math.max(calls.length, puts.length);
+  let html = '<div class="exit-row">';
+  for (let i = 0; i < maxLen; i++) {
+    html += '<div class="exit-pair">';
+    if (calls[i]) html += renderExitCard(calls[i], 'exit-call');
+    else html += '<div class="exit-placeholder"></div>';
+    if (puts[i]) html += renderExitCard(puts[i], 'exit-put');
+    else html += '<div class="exit-placeholder"></div>';
+    html += '</div>';
+  }
+  html += '</div>';
+  el.innerHTML = html;
+}
+
+function renderExitCard(t, cls) {
+  const resultCls = t.result === "WIN" ? "win-tag" : t.result === "LOSS" ? "loss-tag" : "be-tag";
+  const icon = t.type === "CALL" ? "▲" : "▼";
+  return `<div class="exit-card ${cls}">
+    <div class="exit-header">
+      <span class="exit-badge">${icon} ${t.type}</span>
+      <span class="exit-sym">${t.displayName || t.symbol}</span>
+      <span class="${resultCls}">${t.result || '-'}</span>
+    </div>
+    <div class="exit-prices">
+      <span>In: ₹${t.entry}</span>
+      <span>→</span>
+      <span>Out: ₹${t.exitPrice || '-'}</span>
+    </div>
+    <div class="exit-meta">
+      <span class="exit-reason">${t.exitReason || '-'}</span>
+      <span class="exit-pnl ${t.pnl >= 0 ? 'pnl-pos' : 'pnl-neg'}">${t.pnl >= 0 ? '+' : ''}${t.pnl || 0}</span>
+    </div>
+    <div class="ts">${t.exitTimestamp || t.timestamp}</div>
+  </div>`;
+}
+
+function renderHistory(trades) {
+  const el = document.getElementById('history-list');
+  if (!el) return;
+  if (!trades.length) {
+    el.innerHTML = `<div class="empty-state-sm">No historical trades</div>`;
+    return;
+  }
+  const sorted = [...trades].sort((a, b) => (b.exitDate || b.date || '').localeCompare(a.exitDate || a.date || ''));
+  el.innerHTML = sorted.map(t => {
+    const resultCls = t.result === "WIN" ? "hist-win" : t.result === "LOSS" ? "hist-loss" : "hist-be";
+    const icon = t.type === "CALL" ? "▲" : "▼";
+    return `<div class="hist-card">
+      <div class="hist-left">
+        <span class="hist-icon ${t.type === 'CALL' ? 'call-icon' : 'put-icon'}">${icon} ${t.type}</span>
+        <span class="hist-sym">${t.displayName || t.symbol}</span>
+      </div>
+      <div class="hist-mid">
+        <span class="hist-prices">₹${t.entry} → ₹${t.exitPrice || '-'}</span>
+        <span class="hist-sltp">SL: ₹${t.sl} | TP: ₹${t.tp}</span>
+      </div>
+      <div class="hist-right">
+        <span class="${resultCls}">${t.result || '-'}</span>
+        <span class="hist-pnl ${t.pnl >= 0 ? 'pnl-pos' : 'pnl-neg'}">${t.pnl >= 0 ? '+' : ''}${t.pnl || 0}</span>
+        <span class="hist-ts">${t.exitTimestamp || t.timestamp}</span>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function updateStatus(msg) {
+  const el = document.getElementById('engine-status');
+  if (el) el.textContent = msg;
+}
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  if (!t) return;
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 4000);
+}
+
+// ─── Auth UI ───────────────────────────────────────────────────────
+function showAuth() {
+  document.getElementById('auth-screen').style.display = 'flex';
+  document.getElementById('app-screen').style.display = 'none';
+}
+function showApp() {
+  document.getElementById('auth-screen').style.display = 'none';
+  document.getElementById('app-screen').style.display = 'block';
+}
+
+window.handleLogin = async function() {
+  const email = document.getElementById('email').value.trim();
+  const pass = document.getElementById('password').value;
+  const errEl = document.getElementById('auth-error');
+  try {
+    await signInWithEmailAndPassword(auth, email, pass);
+    errEl.textContent = '';
+  } catch(e) {
+    try {
+      await createUserWithEmailAndPassword(auth, email, pass);
+      errEl.textContent = '';
+    } catch(e2) {
+      errEl.textContent = e2.message;
+    }
+  }
+};
+
+window.handleLogout = async function() {
+  if (engineInterval) clearInterval(engineInterval);
+  engineRunning = false;
+  if (signalUnsubscribe) signalUnsubscribe();
+  await signOut(auth);
+};
+</script>
+
+<style>
+:root {
+  --bg: #080c18;
+  --bg2: #0d1224;
+  --bg3: #121929;
+  --panel: #0f1628;
+  --border: #1e2a45;
+  --accent: #00c2ff;
+  --accent2: #ff6f3c;
+  --call: #00c853;
+  --call-bg: rgba(0,200,83,0.12);
+  --put: #ff3d57;
+  --put-bg: rgba(255,61,87,0.12);
+  --text: #e8eaf6;
+  --text2: #7a8bb5;
+  --text3: #4a5a80;
+  --gold: #ffd700;
+  --font-head: 'Exo 2', sans-serif;
+  --font-mono: 'Space Mono', monospace;
+  --font-ui: 'Rajdhani', sans-serif;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui);
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+/* ── Auth Screen ── */
+#auth-screen {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 2rem;
+  background: radial-gradient(ellipse at 50% 0%, #0d2240 0%, #080c18 70%);
+}
+.auth-logo {
+  font-family: var(--font-head);
+  font-size: 2.2rem;
+  font-weight: 800;
+  background: linear-gradient(135deg, #00c2ff, #00ff88, #ffd700);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  margin-bottom: 0.3rem;
+  letter-spacing: 2px;
+}
+.auth-sub { color: var(--text2); font-size: 0.85rem; margin-bottom: 2rem; letter-spacing: 1px; }
+.auth-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 2rem;
+  width: 100%;
+  max-width: 360px;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+}
+.auth-card input {
+  width: 100%;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 0.85rem 1rem;
+  border-radius: 10px;
+  font-family: var(--font-ui);
+  font-size: 1rem;
+  margin-bottom: 1rem;
+  outline: none;
+  transition: border-color 0.2s;
+}
+.auth-card input:focus { border-color: var(--accent); }
+.auth-btn {
+  width: 100%;
+  padding: 0.9rem;
+  background: linear-gradient(135deg, #0062ff, #00c2ff);
+  color: #fff;
+  border: none;
+  border-radius: 10px;
+  font-family: var(--font-head);
+  font-size: 1.1rem;
+  font-weight: 700;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition: opacity 0.2s;
+}
+.auth-btn:active { opacity: 0.8; }
+.auth-hint { color: var(--text3); font-size: 0.8rem; text-align: center; margin-top: 0.8rem; }
+#auth-error { color: #ff6b6b; font-size: 0.82rem; margin-top: 0.5rem; text-align: center; }
+
+/* ── App Shell ── */
+#app-screen { display: none; }
+
+/* ── Top Header ── */
+.app-header {
+  background: linear-gradient(180deg, #0a0f20 0%, var(--bg) 100%);
+  border-bottom: 1px solid var(--border);
+  padding: 1rem 1.2rem 0.8rem;
+  position: sticky; top: 0; z-index: 100;
+  backdrop-filter: blur(20px);
+}
+.header-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.brand {
+  font-family: var(--font-head);
+  font-size: 1.7rem;
+  font-weight: 800;
+  letter-spacing: 3px;
+  background: linear-gradient(90deg, #00c2ff 0%, #00ff88 50%, #ffd700 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  text-shadow: none;
+  position: relative;
+}
+.brand::after {
+  content: '';
+  position: absolute;
+  bottom: -3px; left: 0; right: 0; height: 2px;
+  background: linear-gradient(90deg, #00c2ff, #00ff88, #ffd700);
+  border-radius: 2px;
+  opacity: 0.6;
+}
+.header-right { display: flex; align-items: center; gap: 0.8rem; }
+.logout-btn {
+  background: rgba(255,61,87,0.15);
+  border: 1px solid rgba(255,61,87,0.3);
+  color: #ff6b6b;
+  padding: 0.35rem 0.8rem;
+  border-radius: 8px;
+  font-family: var(--font-ui);
+  font-size: 0.82rem;
+  cursor: pointer;
+}
+.market-badge {
+  background: rgba(0,200,83,0.15);
+  border: 1px solid rgba(0,200,83,0.3);
+  color: var(--call);
+  padding: 0.3rem 0.7rem;
+  border-radius: 8px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.market-dot {
+  width: 7px; height: 7px;
+  background: var(--call);
+  border-radius: 50%;
+  animation: blink 1.2s ease infinite;
+}
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.2} }
+
+#engine-status {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  color: var(--text3);
+  margin-top: 0.5rem;
+  letter-spacing: 0.5px;
+}
+
+/* ── Scroll Container ── */
+.app-scroll {
+  padding: 1rem 0.8rem 6rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.2rem;
+}
+
+/* ── Section Headers ── */
+.section-header {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 0.7rem;
+}
+.section-title {
+  font-family: var(--font-head);
+  font-size: 1rem;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  color: var(--text);
+  text-transform: uppercase;
+}
+.section-line {
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(90deg, var(--border), transparent);
+}
+.section-badge {
+  font-size: 0.7rem;
+  padding: 0.2rem 0.6rem;
+  border-radius: 20px;
+  font-weight: 600;
+}
+.badge-live { background: rgba(0,200,83,0.2); color: var(--call); border: 1px solid rgba(0,200,83,0.3); }
+.badge-today { background: rgba(0,194,255,0.15); color: var(--accent); border: 1px solid rgba(0,194,255,0.25); }
+.badge-hist { background: rgba(122,139,181,0.15); color: var(--text2); border: 1px solid var(--border); }
+
+/* ── Active Signal Cards ── */
+.signal-row { display: flex; flex-direction: column; gap: 0.8rem; }
+.signal-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; }
+.signal-placeholder { min-height: 80px; }
+
+.signal-card {
+  border-radius: 14px;
+  padding: 0.9rem;
+  position: relative;
+  overflow: hidden;
+  transition: transform 0.2s;
+}
+.signal-card:active { transform: scale(0.98); }
+.call-card {
+  background: var(--call-bg);
+  border: 1px solid rgba(0,200,83,0.3);
+  box-shadow: 0 4px 20px rgba(0,200,83,0.1), inset 0 1px 0 rgba(0,200,83,0.15);
+}
+.put-card {
+  background: var(--put-bg);
+  border: 1px solid rgba(255,61,87,0.3);
+  box-shadow: 0 4px 20px rgba(255,61,87,0.1), inset 0 1px 0 rgba(255,61,87,0.15);
+}
+.signal-card::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0; height: 2px;
+}
+.call-card::before { background: linear-gradient(90deg, transparent, var(--call), transparent); }
+.put-card::before { background: linear-gradient(90deg, transparent, var(--put), transparent); }
+
+.card-header {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-bottom: 0.5rem;
+}
+.signal-badge {
+  font-size: 0.7rem;
+  font-weight: 700;
+  padding: 0.15rem 0.45rem;
+  border-radius: 6px;
+  letter-spacing: 0.5px;
+}
+.call-card .signal-badge { background: rgba(0,200,83,0.25); color: var(--call); }
+.put-card .signal-badge { background: rgba(255,61,87,0.25); color: var(--put); }
+.symbol-name {
+  font-family: var(--font-head);
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: var(--text);
+  flex: 1;
+  letter-spacing: 0.5px;
+}
+.live-dot {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--call);
+  animation: blink 1s ease infinite;
+}
+.put-card .live-dot { background: var(--put); }
+
+.entry-price {
+  font-family: var(--font-head);
+  font-size: 1.4rem;
+  font-weight: 800;
+  color: var(--text);
+  line-height: 1;
+  margin-bottom: 0.5rem;
+}
+
+.win-prob {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-bottom: 0.5rem;
+}
+.prob-ring { width: 36px; height: 36px; flex-shrink: 0; }
+.win-prob span {
+  font-family: var(--font-head);
+  font-size: 1.1rem;
+  font-weight: 800;
+  color: var(--prob-color, #00ff88);
+}
+
+.trade-meta { display: flex; flex-direction: column; gap: 0.18rem; }
+.meta-row { display: flex; justify-content: space-between; align-items: center; }
+.lbl { font-size: 0.65rem; color: var(--text3); font-weight: 600; letter-spacing: 0.5px; }
+.val { font-family: var(--font-mono); font-size: 0.7rem; font-weight: 700; }
+.sl-val { color: #ff6b6b; }
+.tp-val { color: #00ff88; }
+.pnl-pos { color: #00ff88; }
+.pnl-neg { color: #ff6b6b; }
+
+.reason-tag {
+  font-size: 0.58rem;
+  color: var(--text3);
+  margin-top: 0.5rem;
+  letter-spacing: 0.3px;
+  line-height: 1.3;
+  border-top: 1px solid rgba(255,255,255,0.05);
+  padding-top: 0.35rem;
+}
+.ts {
+  font-family: var(--font-mono);
+  font-size: 0.55rem;
+  color: var(--text3);
+  margin-top: 0.3rem;
+}
+
+/* ── Today Exit Cards ── */
+.exit-row { display: flex; flex-direction: column; gap: 0.6rem; }
+.exit-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; }
+.exit-placeholder { min-height: 60px; }
+
+.exit-card {
+  border-radius: 10px;
+  padding: 0.65rem 0.7rem;
+  border: 1px solid var(--border);
+}
+.exit-call { background: rgba(0,200,83,0.07); border-color: rgba(0,200,83,0.2); }
+.exit-put { background: rgba(255,61,87,0.07); border-color: rgba(255,61,87,0.2); }
+
+.exit-header {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-bottom: 0.3rem;
+}
+.exit-badge {
+  font-size: 0.65rem;
+  font-weight: 700;
+  padding: 0.1rem 0.35rem;
+  border-radius: 5px;
+}
+.exit-call .exit-badge { background: rgba(0,200,83,0.2); color: var(--call); }
+.exit-put .exit-badge { background: rgba(255,61,87,0.2); color: var(--put); }
+.exit-sym { font-size: 0.68rem; font-weight: 700; flex: 1; color: var(--text); }
+.win-tag { font-size: 0.62rem; font-weight: 700; color: var(--call); }
+.loss-tag { font-size: 0.62rem; font-weight: 700; color: var(--put); }
+.be-tag { font-size: 0.62rem; font-weight: 700; color: var(--gold); }
+
+.exit-prices {
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  color: var(--text2);
+  display: flex;
+  gap: 0.3rem;
+  align-items: center;
+  margin-bottom: 0.2rem;
+}
+.exit-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.exit-reason { font-size: 0.58rem; color: var(--text3); }
+.exit-pnl { font-family: var(--font-mono); font-size: 0.65rem; font-weight: 700; }
+
+/* ── History Cards ── */
+#history-list { display: flex; flex-direction: column; gap: 0.5rem; }
+.hist-card {
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.6rem 0.8rem;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+.hist-left { display: flex; flex-direction: column; gap: 0.15rem; min-width: 52px; }
+.hist-icon { font-size: 0.65rem; font-weight: 700; }
+.call-icon { color: var(--call); }
+.put-icon { color: var(--put); }
+.hist-sym { font-size: 0.62rem; color: var(--text2); font-weight: 600; }
+.hist-mid { flex: 1; display: flex; flex-direction: column; gap: 0.15rem; }
+.hist-prices { font-family: var(--font-mono); font-size: 0.65rem; color: var(--text); }
+.hist-sltp { font-size: 0.6rem; color: var(--text3); }
+.hist-right { display: flex; flex-direction: column; align-items: flex-end; gap: 0.1rem; }
+.hist-win { color: var(--call); font-size: 0.68rem; font-weight: 700; }
+.hist-loss { color: var(--put); font-size: 0.68rem; font-weight: 700; }
+.hist-be { color: var(--gold); font-size: 0.68rem; font-weight: 700; }
+.hist-pnl { font-family: var(--font-mono); font-size: 0.65rem; font-weight: 700; }
+.hist-ts { font-family: var(--font-mono); font-size: 0.55rem; color: var(--text3); text-align: right; }
+
+/* ── Empty States ── */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 2rem;
+  color: var(--text3);
+  gap: 0.8rem;
+}
+.empty-icon { font-size: 2rem; }
+.empty-state p { font-size: 0.82rem; text-align: center; line-height: 1.5; }
+.empty-state-sm {
+  padding: 1rem;
+  text-align: center;
+  color: var(--text3);
+  font-size: 0.78rem;
+}
+
+/* ── Toast ── */
+#toast {
+  position: fixed;
+  bottom: 5rem; left: 50%; transform: translateX(-50%) translateY(10px);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 0.7rem 1.2rem;
+  border-radius: 12px;
+  font-size: 0.85rem;
+  font-family: var(--font-ui);
+  box-shadow: 0 8px 30px rgba(0,0,0,0.5);
+  z-index: 999;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.3s, transform 0.3s;
+  white-space: nowrap;
+  max-width: 90vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+#toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+/* ── Bottom Nav ── */
+.bottom-nav {
+  position: fixed;
+  bottom: 0; left: 0; right: 0;
+  background: var(--bg2);
+  border-top: 1px solid var(--border);
+  padding: 0.5rem 0 0.8rem;
+  display: flex;
+  justify-content: space-around;
+  z-index: 50;
+}
+.nav-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.2rem;
+  color: var(--text3);
+  font-size: 0.65rem;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 0.3rem 1rem;
+  border-radius: 8px;
+  transition: color 0.2s;
+}
+.nav-item.active { color: var(--accent); }
+.nav-icon { font-size: 1.2rem; }
+
+/* ── Section Container ── */
+.section-container {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 1rem;
+}
+
+/* Scrollbars */
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+/* pulse animation for active section */
+@keyframes pulseGlow {
+  0%,100% { box-shadow: 0 0 0 0 rgba(0,200,83,0.2); }
+  50% { box-shadow: 0 0 0 6px rgba(0,200,83,0); }
+}
+</style>
+</head>
+<body>
+
+<!-- Auth Screen -->
+<div id="auth-screen">
+  <div class="auth-logo">BR Traders</div>
+  <div class="auth-sub">INTRADAY SIGNAL ENGINE · NSE/BSE</div>
+  <div class="auth-card">
+    <input type="email" id="email" placeholder="Email address" autocomplete="email"/>
+    <input type="password" id="password" placeholder="Password" autocomplete="current-password"/>
+    <button class="auth-btn" onclick="handleLogin()">LOGIN / REGISTER</button>
+    <p class="auth-hint">New user? Account auto-created on first login.</p>
+    <div id="auth-error"></div>
+  </div>
+</div>
+
+<!-- App Screen -->
+<div id="app-screen">
+
+  <!-- Header -->
+  <div class="app-header">
+    <div class="header-top">
+      <div class="brand">BR TRADERS</div>
+      <div class="header-right">
+        <div class="market-badge">
+          <div class="market-dot"></div>LIVE
+        </div>
+        <button class="logout-btn" onclick="handleLogout()">⏻ Exit</button>
+      </div>
+    </div>
+    <div id="engine-status">⏳ Initializing signal engine...</div>
+  </div>
+
+  <!-- Scrollable Content -->
+  <div class="app-scroll">
+
+    <!-- Active Trades -->
+    <div class="section-container" style="animation: pulseGlow 3s ease infinite;">
+      <div class="section-header">
+        <span class="section-title">Active Trades</span>
+        <span class="section-badge badge-live">● LIVE</span>
+        <div class="section-line"></div>
+      </div>
+      <div id="active-trades">
+        <div class="empty-state">
+          <div class="empty-icon">📡</div>
+          <p>Initializing... Fetching live market data from NSE/BSE</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Today's Exits -->
+    <div class="section-container">
+      <div class="section-header">
+        <span class="section-title">Today's Exits</span>
+        <span class="section-badge badge-today">TODAY</span>
+        <div class="section-line"></div>
+      </div>
+      <div id="today-exits">
+        <div class="empty-state-sm">Loading...</div>
+      </div>
+    </div>
+
+    <!-- History -->
+    <div class="section-container">
+      <div class="section-header">
+        <span class="section-title">Trade History</span>
+        <span class="section-badge badge-hist">ARCHIVE</span>
+        <div class="section-line"></div>
+      </div>
+      <div id="history-list">
+        <div class="empty-state-sm">Loading...</div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Bottom Nav -->
+  <div class="bottom-nav">
+    <div class="nav-item active">
+      <span class="nav-icon">📊</span>Signals
+    </div>
+    <div class="nav-item">
+      <span class="nav-icon">📈</span>Markets
+    </div>
+    <div class="nav-item">
+      <span class="nav-icon">🏆</span>Stats
+    </div>
+    <div class="nav-item">
+      <span class="nav-icon">⚙️</span>Settings
+    </div>
+  </div>
+
+</div>
+
+<!-- Toast -->
+<div id="toast"></div>
+
+</body>
+</html>
