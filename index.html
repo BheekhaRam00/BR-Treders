@@ -1,0 +1,1206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no"/>
+<meta name="theme-color" content="#0a0e1a"/>
+<meta name="mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+<meta name="apple-mobile-web-app-title" content="BR Traders"/>
+<title>BR Traders – Intraday Signals</title>
+<link rel="manifest" href="manifest.json"/>
+<link rel="icon" href="icon-192.png"/>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;500;600;700&family=Space+Mono:wght@400;700&family=Exo+2:wght@300;400;600;800&display=swap" rel="stylesheet"/>
+
+<script type="module">
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  FIREBASE IMPORTS                                            ║
+// ╚══════════════════════════════════════════════════════════════╝
+import { initializeApp }
+  from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import { getAuth, signInWithEmailAndPassword,
+  createUserWithEmailAndPassword, onAuthStateChanged, signOut }
+  from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+import { getFirestore, collection, addDoc, query, orderBy,
+  limit, onSnapshot, doc, setDoc, updateDoc, Timestamp }
+  from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+import { getMessaging, getToken, onMessage }
+  from "https://www.gstatic.com/firebasejs/10.12.2/firebase-messaging.js";
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  FIREBASE CONFIG                                             ║
+// ╚══════════════════════════════════════════════════════════════╝
+const FB_CONFIG = {
+  apiKey:            "AIzaSyDAGTXvnKIWSFVL3c5iMCKjrVivqGy9oCI",
+  authDomain:        "painting-images.firebaseapp.com",
+  projectId:         "painting-images",
+  storageBucket:     "painting-images.firebasestorage.app",
+  messagingSenderId: "634391472131",
+  appId:             "1:634391472131:web:a38a3835931fa786220636",
+  measurementId:     "G-JCN45GCP98"
+};
+const fbApp = initializeApp(FB_CONFIG);
+const auth  = getAuth(fbApp);
+const db    = getFirestore(fbApp);
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  ANGEL ONE CONFIG — REPLACE THESE 4 VALUES                  ║
+// ║  ─────────────────────────────────────────────────────────  ║
+// ║  Step 1: Replace ANGEL_API_KEY with your API Key            ║
+// ║  Step 2: Replace ANGEL_CLIENT_ID with your Client ID        ║
+// ║          (e.g. A123456 — your AngelOne login ID)            ║
+// ║  Step 3: Replace ANGEL_PASSWORD with your login password    ║
+// ║  Step 4: Replace ANGEL_TOTP_SECRET with your TOTP secret    ║
+// ║          (SmartAPI → Enable TOTP → copy the secret)         ║
+// ╚══════════════════════════════════════════════════════════════╝
+const ANGEL_API_KEY     = "paP0DkNg";
+const ANGEL_CLIENT_ID   = "B54354754";
+const ANGEL_PASSWORD    = "1050";
+const ANGEL_TOTP_SECRET = "PLZQ6UCXPQY5FHSUDZXEHFNA6A";
+
+// AngelOne symbol tokens for indices (NSE)
+// Nifty 50   = 99926000  BankNifty = 99926009  Sensex = 99919000
+const ANGEL_SYMBOLS = {
+  NIFTY:     { token: "99926000", exchange: "NSE", name: "NIFTY 50"   },
+  BANKNIFTY: { token: "99926009", exchange: "NSE", name: "BANK NIFTY" },
+  SENSEX:    { token: "99919000", exchange: "BSE", name: "SENSEX"     }
+};
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  FCM VAPID KEY                                               ║
+// ╚══════════════════════════════════════════════════════════════╝
+const VAPID_KEY = "BDs314vPkLiOvO50jbTkhaYl-hzyYj-X5-3uI1b7t1LYZQ8VQrzgl6veSokXscirDLU1DAs1GJdx51JAp22IYSQ";
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  IST TIME HELPERS — Asia/Kolkata, ZERO fixed offset          ║
+// ╚══════════════════════════════════════════════════════════════╝
+function istNow() {
+  // Returns a real Date object representing current IST time
+  return new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+}
+function istStamp() {
+  return new Date().toLocaleString("en-IN", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+    hour12: false
+  });
+}
+function istDate() {
+  return new Date().toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata" });
+}
+function isMarketOpen() {
+  const d    = istNow();
+  const day  = d.getDay(); // 0=Sun, 6=Sat
+  if (day === 0 || day === 6) return false;
+  const mins = d.getHours() * 60 + d.getMinutes();
+  // 9:15 AM = 555 mins,  3:30 PM = 930 mins
+  return mins >= 555 && mins <= 930;
+}
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  GLOBAL STATE                                                ║
+// ╚══════════════════════════════════════════════════════════════╝
+let ME         = null;   // Firebase current user
+let ACTIVE     = {};     // tradeKey -> trade
+let FS_UNSUB   = null;
+let TIMERS     = {};     // tfKey -> interval id
+let ANGEL_JWT  = null;   // AngelOne session token
+let ANGEL_FEED_TOKEN = null;
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  AUTH LISTENER                                               ║
+// ╚══════════════════════════════════════════════════════════════╝
+onAuthStateChanged(auth, user => {
+  ME = user;
+  if (user) {
+    showApp();
+    fsListen();
+    initAngelOne();
+    setupFCM();
+  } else {
+    showAuth();
+    stopAllTimers();
+    ACTIVE = {};
+    ANGEL_JWT = null;
+  }
+});
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  FCM SETUP                                                   ║
+// ╚══════════════════════════════════════════════════════════════╝
+async function setupFCM() {
+  try {
+    if (!("serviceWorker" in navigator)) return;
+    const reg = await navigator.serviceWorker.register("/firebase-messaging-sw.js");
+    const msg = getMessaging(fbApp);
+    const tok = await getToken(msg, {
+      vapidKey: VAPID_KEY,
+      serviceWorkerRegistration: reg
+    });
+    if (tok && ME) {
+      await setDoc(doc(db, "fcmTokens", ME.uid), {
+        token: tok, uid: ME.uid, updatedAt: Timestamp.now()
+      });
+    }
+    onMessage(msg, p => {
+      showToast("🔔 " + (p.notification
+        ? p.notification.title + ": " + p.notification.body
+        : "New Signal"));
+    });
+  } catch (e) { console.warn("FCM:", e.message); }
+}
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  ANGELONE — LOGIN & SESSION                                  ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+// Generate TOTP from secret (RFC 6238 compatible)
+// Using a lightweight pure-JS implementation
+async function generateTOTP(secret) {
+  // Decode base32 secret
+  const base32Chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  const cleanSecret = secret.toUpperCase().replace(/=+$/, "");
+  let bits = "";
+  for (const c of cleanSecret) {
+    const idx = base32Chars.indexOf(c);
+    if (idx === -1) continue;
+    bits += idx.toString(2).padStart(5, "0");
+  }
+  const bytes = [];
+  for (let i = 0; i + 8 <= bits.length; i += 8)
+    bytes.push(parseInt(bits.slice(i, i + 8), 2));
+
+  // Time counter (30 second window)
+  const counter = Math.floor(Date.now() / 1000 / 30);
+  const counterBytes = new Uint8Array(8);
+  let c = counter;
+  for (let i = 7; i >= 0; i--) {
+    counterBytes[i] = c & 0xff;
+    c = Math.floor(c / 256);
+  }
+
+  // HMAC-SHA1
+  const keyData   = new Uint8Array(bytes);
+  const cryptoKey = await crypto.subtle.importKey(
+    "raw", keyData, { name: "HMAC", hash: "SHA-1" }, false, ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", cryptoKey, counterBytes);
+  const hash = new Uint8Array(sig);
+
+  // Dynamic truncation
+  const offset = hash[19] & 0x0f;
+  const code   = (
+    ((hash[offset]     & 0x7f) << 24) |
+    ((hash[offset + 1] & 0xff) << 16) |
+    ((hash[offset + 2] & 0xff) << 8)  |
+     (hash[offset + 3] & 0xff)
+  ) % 1000000;
+
+  return code.toString().padStart(6, "0");
+}
+
+async function angelLogin() {
+  try {
+    if (ANGEL_API_KEY === "REPLACE_YOUR_API_KEY_HERE") {
+      setStatus("⚠️ AngelOne API key not configured");
+      return false;
+    }
+    const totp = await generateTOTP(ANGEL_TOTP_SECRET);
+    const proxy = "https://api.allorigins.win/raw?url=" +
+      encodeURIComponent("https://apiconnect.angelone.in/rest/auth/angelbroking/user/v1/loginByPassword");
+    const res = await fetchWithTimeout(proxy, {
+      method: "POST",
+      headers: {
+        "Content-Type":  "application/json",
+        "Accept":        "application/json",
+        "X-UserType":    "USER",
+        "X-SourceID":    "WEB",
+        "X-ClientLocalIP": "127.0.0.1",
+        "X-ClientPublicIP": "127.0.0.1",
+        "X-MACAddress":  "00:00:00:00:00:00",
+        "X-PrivateKey":  ANGEL_API_KEY
+      },
+      body: JSON.stringify({
+        clientcode: ANGEL_CLIENT_ID,
+        password:   ANGEL_PASSWORD,
+        totp:       totp
+      })
+    }, 15000);
+    const data = await res.json();
+    if (data.status && data.data && data.data.jwtToken) {
+      ANGEL_JWT        = data.data.jwtToken;
+      ANGEL_FEED_TOKEN = data.data.feedToken;
+      console.log("AngelOne login success");
+      return true;
+    } else {
+      console.warn("AngelOne login failed:", data.message);
+      setStatus("⚠️ AngelOne login failed: " + (data.message || "Unknown error"));
+      return false;
+    }
+  } catch (e) {
+    console.warn("AngelOne login error:", e.message);
+    setStatus("⚠️ AngelOne connect error: " + e.message);
+    return false;
+  }
+}
+
+// Re-login every 8 hours (token expires)
+async function initAngelOne() {
+  setStatus("🔐 Connecting to AngelOne...");
+  const ok = await angelLogin();
+  if (ok) {
+    setStatus("✅ AngelOne Connected");
+    startAllTimers();
+    // Refresh token every 8 hours
+    setInterval(angelLogin, 8 * 60 * 60 * 1000);
+  } else {
+    // Retry after 2 minutes
+    setTimeout(initAngelOne, 2 * 60 * 1000);
+  }
+}
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  ANGELONE — FETCH CANDLES                                    ║
+// ║  interval: ONE_MINUTE / THREE_MINUTE / FIVE_MINUTE /        ║
+// ║            FIFTEEN_MINUTE                                    ║
+// ╚══════════════════════════════════════════════════════════════╝
+async function fetchAngel(token, exchange, interval, fromDate, toDate) {
+  if (!ANGEL_JWT) throw new Error("Not logged in to AngelOne");
+  const proxy = "https://api.allorigins.win/raw?url=" +
+    encodeURIComponent("https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData");
+  const res = await fetchWithTimeout(proxy, {
+    method: "POST",
+    headers: {
+      "Content-Type":  "application/json",
+      "Accept":        "application/json",
+      "X-UserType":    "USER",
+      "X-SourceID":    "WEB",
+      "X-ClientLocalIP": "127.0.0.1",
+      "X-ClientPublicIP": "127.0.0.1",
+      "X-MACAddress":  "00:00:00:00:00:00",
+      "X-PrivateKey":  ANGEL_API_KEY,
+      "Authorization": "Bearer " + ANGEL_JWT
+    },
+    body: JSON.stringify({
+      exchange,
+      symboltoken: token,
+      interval,
+      fromdate: fromDate,
+      todate:   toDate
+    })
+  }, 15000);
+  const data = await res.json();
+  if (!data.status || !data.data) throw new Error("AngelOne data error: " + (data.message || "No data"));
+  // AngelOne returns: [timestamp, open, high, low, close, volume]
+  return data.data.map(row => ({
+    t: new Date(row[0]).getTime(),
+    o: row[1], h: row[2], l: row[3], c: row[4], v: row[5] || 0
+  })).filter(x => x.c > 0 && !isNaN(x.c));
+}
+
+// Date helpers for AngelOne API format "YYYY-MM-DD HH:MM"
+function angelFromDate(daysBack) {
+  const d = istNow();
+  d.setDate(d.getDate() - daysBack);
+  d.setHours(9, 15, 0, 0);
+  return d.getFullYear() + "-"
+    + String(d.getMonth() + 1).padStart(2, "0") + "-"
+    + String(d.getDate()).padStart(2, "0") + " 09:15";
+}
+function angelToDate() {
+  const d = istNow();
+  return d.getFullYear() + "-"
+    + String(d.getMonth() + 1).padStart(2, "0") + "-"
+    + String(d.getDate()).padStart(2, "0") + " "
+    + String(d.getHours()).padStart(2, "0") + ":"
+    + String(d.getMinutes()).padStart(2, "0");
+}
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  FETCH WITH TIMEOUT — Bug fix: no AbortSignal.timeout()     ║
+// ╚══════════════════════════════════════════════════════════════╝
+function fetchWithTimeout(url, options, ms) {
+  const controller = new AbortController();
+  const timer      = setTimeout(() => controller.abort(), ms);
+  return fetch(url, { ...options, signal: controller.signal })
+    .finally(() => clearTimeout(timer));
+}
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  TIMEFRAMES                                                  ║
+// ║  3min  → ⚡ Scalping  scan every 3 min                      ║
+// ║  5min  → ⏱ Hold      scan every 5 min                      ║
+// ║  15min → 📈 Intraday  scan every 15 min                     ║
+// ╚══════════════════════════════════════════════════════════════╝
+const TFS = [
+  {
+    key:       "3m",
+    interval:  "THREE_MINUTE",
+    daysBack:  5,
+    cat:       "SCALPING",
+    label:     "⚡ Scalping",
+    scanMs:    3 * 60 * 1000,
+    atrPeriod: 7
+  },
+  {
+    key:       "5m",
+    interval:  "FIVE_MINUTE",
+    daysBack:  7,
+    cat:       "HOLD",
+    label:     "⏱ Hold",
+    scanMs:    5 * 60 * 1000,
+    atrPeriod: 10
+  },
+  {
+    key:       "15m",
+    interval:  "FIFTEEN_MINUTE",
+    daysBack:  15,
+    cat:       "INTRADAY",
+    label:     "📈 Intraday",
+    scanMs:    15 * 60 * 1000,
+    atrPeriod: 14
+  }
+];
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  RATE-LIMITED QUEUE — 700ms gap between API calls            ║
+// ╚══════════════════════════════════════════════════════════════╝
+const Q    = [];
+let Q_BUSY = false;
+
+function enq(fn) {
+  return new Promise((res, rej) => {
+    Q.push({ fn, res, rej });
+    if (!Q_BUSY) drainQ();
+  });
+}
+async function drainQ() {
+  Q_BUSY = true;
+  while (Q.length) {
+    const item = Q.shift();
+    try   { item.res(await item.fn()); }
+    catch (e) { item.rej(e); }
+    await sleep(700);
+  }
+  Q_BUSY = false;
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  INDICATORS                                                  ║
+// ╚══════════════════════════════════════════════════════════════╝
+function calcEMA(closes, period) {
+  if (!closes || closes.length < period) return closes.map(() => closes[0] || 0);
+  const k   = 2 / (period + 1);
+  let   val = closes.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  const out = [];
+  for (let i = 0; i < closes.length; i++) {
+    if (i < period - 1) { out.push(val); continue; }
+    if (i === period - 1) { out.push(val); continue; }
+    val = closes[i] * k + val * (1 - k);
+    out.push(val);
+  }
+  return out;
+}
+
+function calcRSI(closes, period) {
+  period = period || 14;
+  if (closes.length <= period + 1) return closes.map(() => 50);
+  let gains = 0, losses = 0;
+  for (let i = 1; i <= period; i++) {
+    const d = closes[i] - closes[i - 1];
+    if (d >= 0) gains += d; else losses -= d;
+  }
+  let ag = gains / period, al = losses / period;
+  const out = new Array(period + 1).fill(50);
+  for (let i = period + 1; i < closes.length; i++) {
+    const d = closes[i] - closes[i - 1];
+    ag = (ag * (period - 1) + Math.max(d, 0)) / period;
+    al = (al * (period - 1) + Math.max(-d, 0)) / period;
+    out.push(al === 0 ? 100 : 100 - 100 / (1 + ag / al));
+  }
+  return out;
+}
+
+function calcATR(candles, period) {
+  period = period || 14;
+  if (candles.length < 2) return 1;
+  const tr = candles.map((c, i) => {
+    if (i === 0) return c.h - c.l;
+    const pc = candles[i - 1].c;
+    return Math.max(c.h - c.l, Math.abs(c.h - pc), Math.abs(c.l - pc));
+  });
+  const n = Math.min(period, tr.length);
+  let val = tr.slice(0, n).reduce((a, b) => a + b, 0) / n;
+  for (let i = n; i < tr.length; i++) val = (val * (n - 1) + tr[i]) / n;
+  return val || 1;
+}
+
+function calcTrend(candles) {
+  if (candles.length < 20) return "SIDEWAYS";
+  const cl  = candles.map(c => c.c);
+  const e20 = calcEMA(cl, 20);
+  const e50 = cl.length >= 50 ? calcEMA(cl, 50) : null;
+  const n   = cl.length - 1;
+  const p   = cl[n];
+  const v20 = e20[n];
+  const v50 = e50 ? e50[n] : v20 * 0.996;
+  if (p > v20 && v20 > v50) return "UPTREND";
+  if (p < v20 && v20 < v50) return "DOWNTREND";
+  return "SIDEWAYS";
+}
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  CONDITION 1 — VOLATILITY (ATR% > 0.15%)                    ║
+// ╚══════════════════════════════════════════════════════════════╝
+function checkVolatility(candles, atrPeriod) {
+  const a = calcATR(candles, atrPeriod);
+  const p = candles[candles.length - 1].c;
+  return p > 0 && (a / p) * 100 > 0.15;
+}
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  CONDITION 2 — KEY LEVEL (1.5% tolerance)                   ║
+// ║  Support / Resistance / Swing High-Low / Prev Day HL        ║
+// ║  OR volume spike (AngelOne has real volume!)                 ║
+// ╚══════════════════════════════════════════════════════════════╝
+function checkKeyLevel(candles, price) {
+  const TOL  = 0.015;
+  const n    = candles.length;
+  const hist = candles.slice(0, Math.max(n - 3, 5));
+  const levels = [];
+
+  // Support & Resistance
+  levels.push({ v: Math.min(...hist.map(c => c.l)), name: "Support"    });
+  levels.push({ v: Math.max(...hist.map(c => c.h)), name: "Resistance" });
+
+  // Previous day High/Low
+  try {
+    const today = istNow();
+    today.setHours(0, 0, 0, 0);
+    const pdC = candles.filter(c => new Date(c.t) < today);
+    if (pdC.length > 0) {
+      levels.push({ v: Math.max(...pdC.map(c => c.h)), name: "Prev Day High" });
+      levels.push({ v: Math.min(...pdC.map(c => c.l)), name: "Prev Day Low"  });
+    }
+  } catch (_) {}
+
+  // Swing High/Low — local pivot
+  const swSlice = candles.slice(Math.max(0, n - 31), n - 1);
+  for (let i = 1; i < swSlice.length - 1; i++) {
+    if (swSlice[i].h > swSlice[i-1].h && swSlice[i].h > swSlice[i+1].h)
+      levels.push({ v: swSlice[i].h, name: "Swing High" });
+    if (swSlice[i].l < swSlice[i-1].l && swSlice[i].l < swSlice[i+1].l)
+      levels.push({ v: swSlice[i].l, name: "Swing Low"  });
+  }
+
+  // Check proximity
+  for (const lv of levels) {
+    if (!lv.v || lv.v <= 0 || isNaN(lv.v)) continue;
+    if (Math.abs(price - lv.v) / price <= TOL)
+      return { ok: true, levelName: lv.name };
+  }
+
+  // Volume spike — AngelOne gives real volume!
+  const vols  = candles.slice(-12, -1).map(c => c.v).filter(v => v > 0);
+  if (vols.length >= 5) {
+    const avg  = vols.reduce((a, b) => a + b, 0) / vols.length;
+    const last = candles[n - 1].v;
+    if (last > 0 && last > avg * 1.2)
+      return { ok: true, levelName: "Volume Spike" };
+  }
+
+  return { ok: false, levelName: "" };
+}
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  CONDITION 3 — CANDLESTICK PATTERN                          ║
+// ║  Fixed: Engulfing checked first, then Hammer/InvHammer      ║
+// ╚══════════════════════════════════════════════════════════════╝
+function checkPattern(candles) {
+  const n  = candles.length;
+  if (n < 2) return { bull: false, bear: false, name: "" };
+  const cu = candles[n - 1];
+  const pr = candles[n - 2];
+
+  const body = Math.abs(cu.c - cu.o);
+  if (body === 0) return { bull: false, bear: false, name: "" };
+
+  const topBody    = Math.max(cu.o, cu.c);
+  const bottomBody = Math.min(cu.o, cu.c);
+  const upperWick  = cu.h - topBody;
+  const lowerWick  = bottomBody - cu.l;
+
+  // Bullish Engulfing — FIRST
+  if (pr.c < pr.o && cu.c > cu.o) {
+    if (cu.o <= pr.c && cu.c >= pr.o)
+      return { bull: true, bear: false, name: "Bullish Engulfing" };
+  }
+
+  // Bearish Engulfing — FIRST
+  if (pr.c > pr.o && cu.c < cu.o) {
+    if (cu.o >= pr.c && cu.c <= pr.o)
+      return { bull: false, bear: true, name: "Bearish Engulfing" };
+  }
+
+  // Hammer — bullish (lower wick >= 2x body, upper wick <= 30% body)
+  if (lowerWick >= body * 2 && upperWick <= body * 0.3)
+    return { bull: true, bear: false, name: "Hammer" };
+
+  // Inverted Hammer — bearish (upper wick >= 2x body, lower wick <= 30% body)
+  if (upperWick >= body * 2 && lowerWick <= body * 0.3)
+    return { bull: false, bear: true, name: "Inverted Hammer" };
+
+  return { bull: false, bear: false, name: "" };
+}
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  WIN PROBABILITY SCORING                                     ║
+// ╚══════════════════════════════════════════════════════════════╝
+function calcWinProb(candles, stype, levelName, patternName) {
+  let score   = 45;
+  const cl    = candles.map(c => c.c);
+  const tr    = calcTrend(candles);
+  const rsiArr = calcRSI(cl, 14);
+  const lr    = rsiArr[rsiArr.length - 1];
+
+  if (stype === "CALL" && tr === "UPTREND")     score += 20;
+  if (stype === "PUT"  && tr === "DOWNTREND")   score += 20;
+  if (stype === "CALL" && tr !== "DOWNTREND")   score += 5;
+  if (stype === "PUT"  && tr !== "UPTREND")     score += 5;
+  if (stype === "CALL" && lr >= 30 && lr <= 65) score += 12;
+  if (stype === "PUT"  && lr >= 35 && lr <= 72) score += 12;
+  if (patternName.includes("Engulfing"))        score += 8;
+  const keyLevels = ["Support","Resistance","Swing High","Swing Low","Prev Day High","Prev Day Low"];
+  if (keyLevels.includes(levelName))            score += 8;
+  score += 5; // R:R bonus always
+
+  return Math.min(Math.round(score), 92);
+}
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  ANALYZE ONE SYMBOL + ONE TIMEFRAME                          ║
+// ╚══════════════════════════════════════════════════════════════╝
+async function analyze(symKey, symCfg, tfc) {
+  const fromDate = angelFromDate(tfc.daysBack);
+  const toDate   = angelToDate();
+  const candles  = await fetchAngel(symCfg.token, symCfg.exchange, tfc.interval, fromDate, toDate);
+
+  if (!candles || candles.length < 20) return null;
+
+  const n     = candles.length;
+  const price = candles[n - 1].c;
+  if (!price || isNaN(price) || price <= 0) return null;
+
+  // CONDITION 1 — Volatility
+  if (!checkVolatility(candles, tfc.atrPeriod)) return null;
+
+  // CONDITION 2 — Key level or volume spike
+  const kl = checkKeyLevel(candles, price);
+  if (!kl.ok) return null;
+
+  // CONDITION 3 — Candlestick pattern
+  const pt = checkPattern(candles);
+  if (!pt.bull && !pt.bear) return null;
+
+  // All 3 conditions met!
+  const stype = pt.bull ? "CALL" : "PUT";
+  const a     = calcATR(candles, tfc.atrPeriod);
+
+  const entry = parseFloat(price.toFixed(2));
+  const sl    = stype === "CALL"
+    ? parseFloat((entry - a * 1.5).toFixed(2))
+    : parseFloat((entry + a * 1.5).toFixed(2));
+  const tp    = stype === "CALL"
+    ? parseFloat((entry + a * 2.5).toFixed(2))
+    : parseFloat((entry - a * 2.5).toFixed(2));
+
+  const prob  = calcWinProb(candles, stype, kl.levelName, pt.name);
+  const trKey = symKey + "_" + tfc.key;
+
+  return {
+    tradeKey:       trKey,
+    symbol:         symKey,
+    displayName:    symCfg.name,
+    type:           stype,
+    category:       tfc.cat,
+    categoryLabel:  tfc.label,
+    timeframe:      tfc.key,
+    entry,
+    sl,
+    tp,
+    currentPrice:   entry,
+    winProbability: prob,
+    trend:          calcTrend(candles),
+    atr:            parseFloat(a.toFixed(2)),
+    levelHit:       kl.levelName,
+    patternName:    pt.name,
+    reasons:        pt.name + " @ " + kl.levelName,
+    timestamp:      istStamp(),
+    date:           istDate(),
+    status:         "ACTIVE",
+    uid:            ME ? ME.uid : ""
+  };
+}
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  EXIT CHECK                                                  ║
+// ╚══════════════════════════════════════════════════════════════╝
+async function checkExit(trade) {
+  const sc  = ANGEL_SYMBOLS[trade.symbol];
+  const tfc = TFS.find(t => t.key === trade.timeframe);
+  if (!sc || !tfc) return { exit: false, price: trade.currentPrice, prob: trade.winProbability };
+
+  const candles = await fetchAngel(sc.token, sc.exchange, tfc.interval, angelFromDate(tfc.daysBack), angelToDate());
+  if (!candles || candles.length < 2)
+    return { exit: false, price: trade.currentPrice, prob: trade.winProbability };
+
+  const n      = candles.length;
+  const cu     = candles[n - 1];
+  const pr     = candles[n - 2];
+  const px     = parseFloat(cu.c.toFixed(2));
+  const tr     = calcTrend(candles);
+  let   reason = null;
+
+  if (trade.type === "CALL") {
+    if      (px <= trade.sl) reason = "SL Hit";
+    else if (px >= trade.tp) reason = "TP Hit";
+    else if (pr.c > pr.o && cu.c < cu.o && cu.o >= pr.c && cu.c <= pr.o)
+                             reason = "Bearish Engulfing";
+    else {
+      const b = Math.abs(cu.c - cu.o);
+      if (b > 0) {
+        const uw = cu.h - Math.max(cu.o, cu.c);
+        const lw = Math.min(cu.o, cu.c) - cu.l;
+        if (uw >= b * 2 && lw <= b * 0.3) reason = "Inverted Hammer";
+      }
+    }
+    if (!reason && tr === "DOWNTREND") reason = "Trend Reversal";
+  } else {
+    if      (px >= trade.sl) reason = "SL Hit";
+    else if (px <= trade.tp) reason = "TP Hit";
+    else if (pr.c < pr.o && cu.c > cu.o && cu.o <= pr.c && cu.c >= pr.o)
+                             reason = "Bullish Engulfing";
+    else {
+      const b = Math.abs(cu.c - cu.o);
+      if (b > 0) {
+        const lw = Math.min(cu.o, cu.c) - cu.l;
+        const uw = cu.h - Math.max(cu.o, cu.c);
+        if (lw >= b * 2 && uw <= b * 0.3) reason = "Hammer";
+      }
+    }
+    if (!reason && tr === "UPTREND") reason = "Trend Reversal";
+  }
+
+  const pnlPct = trade.type === "CALL"
+    ? ((px - trade.entry) / trade.entry) * 100
+    : ((trade.entry - px) / trade.entry) * 100;
+  const newProb = Math.round(Math.max(20, Math.min(92, trade.winProbability + pnlPct * 4)));
+
+  return { exit: reason !== null, reason: reason || "", price: px, prob: newProb };
+}
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  ENGINE — per-timeframe independent timers                   ║
+// ╚══════════════════════════════════════════════════════════════╝
+function startAllTimers() {
+  stopAllTimers();
+  TFS.forEach(tfc => {
+    runScan(tfc);                                          // immediate first scan
+    TIMERS[tfc.key] = setInterval(() => runScan(tfc), tfc.scanMs);
+  });
+}
+function stopAllTimers() {
+  Object.values(TIMERS).forEach(id => clearInterval(id));
+  TIMERS = {};
+}
+
+async function runScan(tfc) {
+  if (!ME || !ANGEL_JWT) return;
+  if (!isMarketOpen()) {
+    setStatus("🌙 Market Closed — " + istStamp());
+    return;
+  }
+  setStatus("📡 Scanning " + tfc.label + " — " + istStamp());
+
+  for (const [sk, sc] of Object.entries(ANGEL_SYMBOLS)) {
+    const trKey = sk + "_" + tfc.key;
+    await enq(async () => {
+      try {
+        if (ACTIVE[trKey]) {
+          const ex = await checkExit(ACTIVE[trKey]);
+          if (ex.exit) await fsExit(trKey, ex.reason, ex.price);
+          else          await fsUpdate(trKey, ex.price, ex.prob);
+        } else {
+          const sig = await analyze(sk, sc, tfc);
+          if (sig) {
+            await fsSave(sig);
+            showToast("🎯 " + sig.displayName + " " + sig.type
+              + " " + sig.categoryLabel + " @ ₹" + sig.entry);
+          }
+        }
+      } catch (e) {
+        console.warn("[" + sk + "][" + tfc.key + "]", e.message);
+        // If JWT expired, re-login
+        if (e.message && e.message.includes("401")) angelLogin();
+      }
+    });
+  }
+  setStatus("✅ Last Update: " + istStamp());
+}
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  FIRESTORE OPERATIONS                                        ║
+// ╚══════════════════════════════════════════════════════════════╝
+async function fsSave(sig) {
+  const ref = await addDoc(collection(db, "signals_v2"), { ...sig, createdAt: Timestamp.now() });
+  ACTIVE[sig.tradeKey] = { ...sig, id: ref.id };
+  renderAll();
+}
+
+async function fsExit(trKey, reason, exitPrice) {
+  const tr = ACTIVE[trKey];
+  if (!tr || !tr.id) return;
+  const pnl    = tr.type === "CALL"
+    ? parseFloat((exitPrice - tr.entry).toFixed(2))
+    : parseFloat((tr.entry - exitPrice).toFixed(2));
+  const result = pnl > 0 ? "WIN" : pnl < 0 ? "LOSS" : "BREAKEVEN";
+  await updateDoc(doc(db, "signals_v2", tr.id), {
+    status: "EXITED", exitPrice, exitReason: reason,
+    result, pnl, exitTimestamp: istStamp(), exitDate: istDate(),
+    updatedAt: Timestamp.now()
+  });
+  delete ACTIVE[trKey];
+  renderAll();
+}
+
+async function fsUpdate(trKey, px, prob) {
+  const tr = ACTIVE[trKey];
+  if (!tr || !tr.id) return;
+  ACTIVE[trKey] = { ...tr, currentPrice: px, winProbability: prob };
+  await updateDoc(doc(db, "signals_v2", tr.id), {
+    currentPrice: px, winProbability: prob, updatedAt: Timestamp.now()
+  });
+  renderAll();
+}
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  FIRESTORE LIVE LISTENER                                     ║
+// ╚══════════════════════════════════════════════════════════════╝
+function fsListen() {
+  if (FS_UNSUB) FS_UNSUB();
+  const q = query(collection(db, "signals_v2"), orderBy("createdAt", "desc"), limit(150));
+  FS_UNSUB = onSnapshot(q, snap => {
+    const all = snap.docs.map(d => ({ ...d.data(), id: d.id }));
+    ACTIVE = {};
+    all.filter(s => s.status === "ACTIVE" && s.uid === (ME ? ME.uid : ""))
+       .forEach(s => { if (s.tradeKey) ACTIVE[s.tradeKey] = s; });
+    renderAll(all);
+  }, err => console.warn("FS:", err.message));
+}
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  RENDER                                                      ║
+// ╚══════════════════════════════════════════════════════════════╝
+function catBadge(cat) {
+  const m = {
+    SCALPING: '<span class="cat-badge cat-scalp">&#9889; Scalping</span>',
+    HOLD:     '<span class="cat-badge cat-hold">&#9201; Hold</span>',
+    INTRADAY: '<span class="cat-badge cat-intra">&#128200; Intraday</span>'
+  };
+  return m[cat] || "";
+}
+
+function renderAll(all) {
+  const uid = ME ? ME.uid : "";
+  let acts = [], todayEx = [], hist = [];
+  if (all) {
+    const tod = istDate();
+    const my  = all.filter(s => s.uid === uid);
+    acts    = my.filter(s => s.status === "ACTIVE");
+    todayEx = my.filter(s => s.status === "EXITED" && s.exitDate === tod)
+               .sort((a, b) => (b.exitTimestamp||"").localeCompare(a.exitTimestamp||""));
+    hist    = my.filter(s => s.status === "EXITED" && s.exitDate !== tod)
+               .sort((a, b) => (b.exitDate||b.date||"").localeCompare(a.exitDate||a.date||""));
+  } else {
+    acts = Object.values(ACTIVE);
+  }
+  renderActive(acts);
+  renderToday(todayEx);
+  renderHist(hist);
+}
+
+function renderActive(trades) {
+  const el = document.getElementById("active-trades");
+  if (!el) return;
+  if (!trades || !trades.length) {
+    el.innerHTML = '<div class="empty-state"><div class="empty-icon">&#128225;</div>'
+      + "<p>Scanning markets for high-probability setups...</p></div>";
+    return;
+  }
+  const calls  = trades.filter(t => t.type === "CALL");
+  const puts   = trades.filter(t => t.type === "PUT");
+  const maxLen = Math.max(calls.length, puts.length);
+  let html = "";
+  for (let i = 0; i < maxLen; i++) {
+    html += '<div class="signal-pair">';
+    html += calls[i] ? buildActiveCard(calls[i]) : '<div class="signal-placeholder"></div>';
+    html += puts[i]  ? buildActiveCard(puts[i])  : '<div class="signal-placeholder"></div>';
+    html += "</div>";
+  }
+  el.innerHTML = html;
+}
+
+function buildActiveCard(t) {
+  const isC  = t.type === "CALL";
+  const cls  = isC ? "call-card" : "put-card";
+  const icon = isC ? "&#9650;" : "&#9660;";
+  const cmp  = t.currentPrice || t.entry;
+  const pnlN = isC ? (cmp - t.entry) : (t.entry - cmp);
+  const pnlS = (pnlN >= 0 ? "+" : "") + pnlN.toFixed(2);
+  const pcls = pnlN >= 0 ? "pnl-pos" : "pnl-neg";
+  const prob = t.winProbability || 45;
+  const pc   = prob >= 75 ? "#00ff88" : prob >= 60 ? "#ffd700" : "#ff6b6b";
+  const dash = ((prob / 100) * 94.2).toFixed(1);
+  return '<div class="signal-card ' + cls + '">'
+    + '<div class="card-header">'
+    +   '<span class="signal-badge">' + icon + " " + t.type + "</span>"
+    +   '<span class="symbol-name">' + (t.displayName || t.symbol) + "</span>"
+    +   '<div class="live-dot"></div>'
+    + "</div>"
+    + catBadge(t.category)
+    + '<div class="entry-price">&#8377;' + t.entry + "</div>"
+    + '<div class="win-prob" style="--pc:' + pc + '">'
+    +   '<svg viewBox="0 0 36 36" class="prob-ring">'
+    +     '<circle cx="18" cy="18" r="15" fill="none" stroke="#1a2035" stroke-width="3"/>'
+    +     '<circle cx="18" cy="18" r="15" fill="none" stroke="' + pc + '" stroke-width="3"'
+    +     ' stroke-dasharray="' + dash + ' 94.2" stroke-linecap="round" transform="rotate(-90 18 18)"/>'
+    +   "</svg><span>" + prob + "%</span>"
+    + "</div>"
+    + '<div class="trade-meta">'
+    +   '<div class="meta-row"><span class="lbl">CMP</span><span class="val ' + pcls + '">&#8377;' + cmp + "</span></div>"
+    +   '<div class="meta-row"><span class="lbl">SL</span><span class="val sl-val">&#8377;' + t.sl + "</span></div>"
+    +   '<div class="meta-row"><span class="lbl">TP</span><span class="val tp-val">&#8377;' + t.tp + "</span></div>"
+    +   '<div class="meta-row"><span class="lbl">P&amp;L</span><span class="val ' + pcls + '">' + pnlS + "</span></div>"
+    + "</div>"
+    + '<div class="reason-tag">' + (t.reasons || "") + "</div>"
+    + '<div class="ts">' + (t.timestamp || "") + "</div>"
+    + "</div>";
+}
+
+function renderToday(trades) {
+  const el = document.getElementById("today-exits");
+  if (!el) return;
+  if (!trades || !trades.length) {
+    el.innerHTML = '<div class="empty-state-sm">No exits today yet</div>'; return;
+  }
+  const calls  = trades.filter(t => t.type === "CALL");
+  const puts   = trades.filter(t => t.type === "PUT");
+  const maxLen = Math.max(calls.length, puts.length);
+  let html = "";
+  for (let i = 0; i < maxLen; i++) {
+    html += '<div class="exit-pair">';
+    html += calls[i] ? buildExitCard(calls[i], "exit-call") : '<div class="exit-placeholder"></div>';
+    html += puts[i]  ? buildExitCard(puts[i],  "exit-put")  : '<div class="exit-placeholder"></div>';
+    html += "</div>";
+  }
+  el.innerHTML = html;
+}
+
+function buildExitCard(t, cls) {
+  const rc   = t.result === "WIN" ? "win-tag" : t.result === "LOSS" ? "loss-tag" : "be-tag";
+  const icon = t.type === "CALL" ? "&#9650;" : "&#9660;";
+  const pnlN = t.pnl || 0;
+  return '<div class="exit-card ' + cls + '">'
+    + '<div class="exit-header">'
+    +   '<span class="exit-badge">' + icon + " " + t.type + "</span>"
+    +   '<span class="exit-sym">' + (t.displayName || t.symbol) + "</span>"
+    +   '<span class="' + rc + '">' + (t.result || "-") + "</span>"
+    + "</div>"
+    + catBadge(t.category)
+    + '<div class="exit-prices"><span>In:&#8377;' + t.entry + "</span><span>&#8594;</span><span>Out:&#8377;" + (t.exitPrice || "-") + "</span></div>"
+    + '<div class="exit-meta"><span class="exit-reason">' + (t.exitReason || "-") + "</span>"
+    + '<span class="exit-pnl ' + (pnlN >= 0 ? "pnl-pos" : "pnl-neg") + '">' + (pnlN >= 0 ? "+" : "") + pnlN + "</span></div>"
+    + '<div class="ts">' + (t.exitTimestamp || t.timestamp || "") + "</div>"
+    + "</div>";
+}
+
+function renderHist(trades) {
+  const el = document.getElementById("history-list");
+  if (!el) return;
+  if (!trades || !trades.length) {
+    el.innerHTML = '<div class="empty-state-sm">No historical trades</div>'; return;
+  }
+  el.innerHTML = trades.map(t => {
+    const rc   = t.result === "WIN" ? "hist-win" : t.result === "LOSS" ? "hist-loss" : "hist-be";
+    const icon = t.type === "CALL" ? "&#9650;" : "&#9660;";
+    const pnlN = t.pnl || 0;
+    return '<div class="hist-card">'
+      + '<div class="hist-left"><span class="hist-icon ' + (t.type==="CALL"?"call-icon":"put-icon") + '">' + icon + " " + t.type + "</span>"
+      + '<span class="hist-sym">' + (t.displayName || t.symbol) + "</span>" + catBadge(t.category) + "</div>"
+      + '<div class="hist-mid"><span class="hist-prices">&#8377;' + t.entry + " &#8594; &#8377;" + (t.exitPrice||"-") + "</span>"
+      + '<span class="hist-sltp">SL:&#8377;' + t.sl + " | TP:&#8377;" + t.tp + "</span></div>"
+      + '<div class="hist-right"><span class="' + rc + '">' + (t.result||"-") + "</span>"
+      + '<span class="hist-pnl ' + (pnlN>=0?"pnl-pos":"pnl-neg") + '">' + (pnlN>=0?"+":"") + pnlN + "</span>"
+      + '<span class="hist-ts">' + (t.exitTimestamp||t.timestamp||"") + "</span></div>"
+      + "</div>";
+  }).join("");
+}
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  UI HELPERS                                                  ║
+// ╚══════════════════════════════════════════════════════════════╝
+function setStatus(m) {
+  const el = document.getElementById("engine-status");
+  if (el) el.textContent = m;
+}
+function showToast(m) {
+  const el = document.getElementById("toast");
+  if (!el) return;
+  el.textContent = m;
+  el.classList.add("show");
+  setTimeout(() => el.classList.remove("show"), 5000);
+}
+function showAuth() {
+  document.getElementById("auth-screen").style.display = "flex";
+  document.getElementById("app-screen").style.display  = "none";
+}
+function showApp() {
+  document.getElementById("auth-screen").style.display = "none";
+  document.getElementById("app-screen").style.display  = "block";
+}
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  AUTH HANDLERS                                               ║
+// ╚══════════════════════════════════════════════════════════════╝
+window.handleLogin = async function() {
+  const email = document.getElementById("email").value.trim();
+  const pass  = document.getElementById("password").value;
+  const errEl = document.getElementById("auth-error");
+  errEl.textContent = "";
+  if (!email || !pass) { errEl.textContent = "Email and password required."; return; }
+  try {
+    await signInWithEmailAndPassword(auth, email, pass);
+  } catch (e) {
+    const newCodes = ["auth/user-not-found","auth/invalid-credential","auth/invalid-email"];
+    if (newCodes.includes(e.code)) {
+      try { await createUserWithEmailAndPassword(auth, email, pass); }
+      catch (e2) { errEl.textContent = e2.message; }
+    } else { errEl.textContent = e.message; }
+  }
+};
+
+window.handleLogout = async function() {
+  stopAllTimers();
+  if (FS_UNSUB) { FS_UNSUB(); FS_UNSUB = null; }
+  ACTIVE = {}; ANGEL_JWT = null;
+  await signOut(auth);
+};
+</script>
+
+<style>
+:root{
+  --bg:#080c18;--bg2:#0d1224;--bg3:#121929;
+  --panel:#0f1628;--border:#1e2a45;--accent:#00c2ff;
+  --call:#00c853;--call-bg:rgba(0,200,83,.12);
+  --put:#ff3d57;--put-bg:rgba(255,61,87,.12);
+  --text:#e8eaf6;--text2:#7a8bb5;--text3:#4a5a80;--gold:#ffd700;
+  --fh:'Exo 2',sans-serif;--fm:'Space Mono',monospace;--fu:'Rajdhani',sans-serif;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+body{background:var(--bg);color:var(--text);font-family:var(--fu);min-height:100vh;overflow-x:hidden}
+#auth-screen{display:flex;flex-direction:column;align-items:center;justify-content:center;
+  min-height:100vh;padding:2rem 1.5rem;background:radial-gradient(ellipse at 50% 0%,#0d2240 0%,#080c18 70%)}
+.auth-logo{font-family:var(--fh);font-size:2.4rem;font-weight:800;letter-spacing:3px;
+  background:linear-gradient(135deg,#00c2ff,#00ff88,#ffd700);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;margin-bottom:.3rem}
+.auth-sub{color:var(--text2);font-size:.82rem;letter-spacing:1.5px;margin-bottom:2rem}
+.auth-card{background:var(--panel);border:1px solid var(--border);border-radius:16px;
+  padding:2rem;width:100%;max-width:360px;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+.auth-card input{width:100%;background:var(--bg3);border:1px solid var(--border);color:var(--text);
+  padding:.85rem 1rem;border-radius:10px;font-family:var(--fu);font-size:1rem;
+  margin-bottom:1rem;outline:none;transition:border-color .2s}
+.auth-card input:focus{border-color:var(--accent)}
+.auth-btn{width:100%;padding:.9rem;background:linear-gradient(135deg,#0062ff,#00c2ff);color:#fff;
+  border:none;border-radius:10px;font-family:var(--fh);font-size:1.1rem;font-weight:700;
+  letter-spacing:1px;cursor:pointer;transition:opacity .2s}
+.auth-btn:active{opacity:.8}
+.auth-hint{color:var(--text3);font-size:.78rem;text-align:center;margin-top:.7rem}
+#auth-error{color:#ff6b6b;font-size:.8rem;margin-top:.5rem;text-align:center;min-height:1rem}
+#app-screen{display:none}
+.app-header{background:linear-gradient(180deg,#0a0f20 0%,var(--bg) 100%);
+  border-bottom:1px solid var(--border);padding:.9rem 1.2rem .7rem;
+  position:sticky;top:0;z-index:100;backdrop-filter:blur(20px)}
+.header-top{display:flex;align-items:center;justify-content:space-between}
+.brand{font-family:var(--fh);font-size:1.7rem;font-weight:800;letter-spacing:3px;
+  background:linear-gradient(90deg,#00c2ff 0%,#00ff88 50%,#ffd700 100%);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;position:relative}
+.brand::after{content:'';position:absolute;bottom:-3px;left:0;right:0;height:2px;
+  background:linear-gradient(90deg,#00c2ff,#00ff88,#ffd700);border-radius:2px;opacity:.6}
+.header-right{display:flex;align-items:center;gap:.7rem}
+.market-badge{background:rgba(0,200,83,.15);border:1px solid rgba(0,200,83,.3);color:var(--call);
+  padding:.3rem .7rem;border-radius:8px;font-size:.75rem;font-weight:600;
+  display:flex;align-items:center;gap:.4rem}
+.market-dot{width:7px;height:7px;background:var(--call);border-radius:50%;animation:blink 1.2s ease infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.2}}
+.logout-btn{background:rgba(255,61,87,.15);border:1px solid rgba(255,61,87,.3);color:#ff6b6b;
+  padding:.3rem .75rem;border-radius:8px;font-family:var(--fu);font-size:.8rem;cursor:pointer}
+#engine-status{font-family:var(--fm);font-size:.65rem;color:var(--text3);margin-top:.45rem;letter-spacing:.4px}
+.app-scroll{padding:1rem .8rem 6rem;display:flex;flex-direction:column;gap:1.2rem}
+.section-container{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:1rem}
+.section-header{display:flex;align-items:center;gap:.6rem;margin-bottom:.8rem}
+.section-title{font-family:var(--fh);font-size:.95rem;font-weight:700;letter-spacing:1.5px;color:var(--text);text-transform:uppercase}
+.section-line{flex:1;height:1px;background:linear-gradient(90deg,var(--border),transparent)}
+.section-badge{font-size:.68rem;padding:.18rem .55rem;border-radius:20px;font-weight:600}
+.badge-live{background:rgba(0,200,83,.2);color:var(--call);border:1px solid rgba(0,200,83,.3)}
+.badge-today{background:rgba(0,194,255,.15);color:var(--accent);border:1px solid rgba(0,194,255,.25)}
+.badge-hist{background:rgba(122,139,181,.15);color:var(--text2);border:1px solid var(--border)}
+.cat-badge{display:inline-block;font-size:.58rem;font-weight:700;padding:.1rem .4rem;border-radius:5px;letter-spacing:.3px;margin-bottom:.3rem}
+.cat-scalp{background:rgba(255,215,0,.2);color:#ffd700;border:1px solid rgba(255,215,0,.3)}
+.cat-hold{background:rgba(0,194,255,.15);color:var(--accent);border:1px solid rgba(0,194,255,.25)}
+.cat-intra{background:rgba(180,100,255,.15);color:#c084fc;border:1px solid rgba(180,100,255,.25)}
+.signal-pair{display:grid;grid-template-columns:1fr 1fr;gap:.6rem;margin-bottom:.7rem}
+.signal-placeholder{min-height:60px}
+.signal-card{border-radius:13px;padding:.85rem .8rem;position:relative;overflow:hidden;transition:transform .15s}
+.signal-card:active{transform:scale(.97)}
+.call-card{background:var(--call-bg);border:1px solid rgba(0,200,83,.3);box-shadow:0 4px 18px rgba(0,200,83,.08),inset 0 1px 0 rgba(0,200,83,.12)}
+.put-card{background:var(--put-bg);border:1px solid rgba(255,61,87,.3);box-shadow:0 4px 18px rgba(255,61,87,.08),inset 0 1px 0 rgba(255,61,87,.12)}
+.signal-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px}
+.call-card::before{background:linear-gradient(90deg,transparent,var(--call),transparent)}
+.put-card::before{background:linear-gradient(90deg,transparent,var(--put),transparent)}
+.card-header{display:flex;align-items:center;gap:.35rem;margin-bottom:.35rem}
+.signal-badge{font-size:.65rem;font-weight:700;padding:.12rem .4rem;border-radius:5px}
+.call-card .signal-badge{background:rgba(0,200,83,.25);color:var(--call)}
+.put-card .signal-badge{background:rgba(255,61,87,.25);color:var(--put)}
+.symbol-name{font-family:var(--fh);font-size:.7rem;font-weight:700;color:var(--text);flex:1}
+.live-dot{width:6px;height:6px;border-radius:50%;animation:blink 1s ease infinite}
+.call-card .live-dot{background:var(--call)}.put-card .live-dot{background:var(--put)}
+.entry-price{font-family:var(--fh);font-size:1.35rem;font-weight:800;color:var(--text);line-height:1;margin:.3rem 0 .4rem}
+.win-prob{display:flex;align-items:center;gap:.4rem;margin-bottom:.45rem}
+.prob-ring{width:34px;height:34px;flex-shrink:0}
+.win-prob span{font-family:var(--fh);font-size:1.05rem;font-weight:800;color:var(--pc,#00ff88)}
+.trade-meta{display:flex;flex-direction:column;gap:.15rem}
+.meta-row{display:flex;justify-content:space-between;align-items:center}
+.lbl{font-size:.62rem;color:var(--text3);font-weight:600;letter-spacing:.4px}
+.val{font-family:var(--fm);font-size:.67rem;font-weight:700}
+.sl-val{color:#ff6b6b}.tp-val{color:#00ff88}.pnl-pos{color:#00ff88}.pnl-neg{color:#ff6b6b}
+.reason-tag{font-size:.56rem;color:var(--text3);margin-top:.45rem;border-top:1px solid rgba(255,255,255,.05);padding-top:.3rem;line-height:1.3}
+.ts{font-family:var(--fm);font-size:.52rem;color:var(--text3);margin-top:.25rem}
+.exit-pair{display:grid;grid-template-columns:1fr 1fr;gap:.55rem;margin-bottom:.55rem}
+.exit-placeholder{min-height:50px}
+.exit-card{border-radius:10px;padding:.6rem .65rem;border:1px solid var(--border)}
+.exit-call{background:rgba(0,200,83,.07);border-color:rgba(0,200,83,.2)}
+.exit-put{background:rgba(255,61,87,.07);border-color:rgba(255,61,87,.2)}
+.exit-header{display:flex;align-items:center;gap:.3rem;margin-bottom:.2rem}
+.exit-badge{font-size:.62rem;font-weight:700;padding:.1rem .32rem;border-radius:4px}
+.exit-call .exit-badge{background:rgba(0,200,83,.2);color:var(--call)}
+.exit-put .exit-badge{background:rgba(255,61,87,.2);color:var(--put)}
+.exit-sym{font-size:.65rem;font-weight:700;flex:1;color:var(--text)}
+.win-tag{font-size:.6rem;font-weight:700;color:var(--call)}
+.loss-tag{font-size:.6rem;font-weight:700;color:var(--put)}
+.be-tag{font-size:.6rem;font-weight:700;color:var(--gold)}
+.exit-prices{font-family:var(--fm);font-size:.62rem;color:var(--text2);display:flex;gap:.3rem;align-items:center;margin-bottom:.2rem}
+.exit-meta{display:flex;justify-content:space-between;align-items:center}
+.exit-reason{font-size:.56rem;color:var(--text3)}.exit-pnl{font-family:var(--fm);font-size:.62rem;font-weight:700}
+#history-list{display:flex;flex-direction:column;gap:.45rem}
+.hist-card{background:var(--bg3);border:1px solid var(--border);border-radius:10px;padding:.55rem .75rem;display:flex;align-items:center;gap:.55rem}
+.hist-left{display:flex;flex-direction:column;gap:.12rem;min-width:54px}
+.hist-icon{font-size:.62rem;font-weight:700}.call-icon{color:var(--call)}.put-icon{color:var(--put)}
+.hist-sym{font-size:.6rem;color:var(--text2);font-weight:600}
+.hist-mid{flex:1;display:flex;flex-direction:column;gap:.12rem}
+.hist-prices{font-family:var(--fm);font-size:.62rem;color:var(--text)}
+.hist-sltp{font-size:.57rem;color:var(--text3)}
+.hist-right{display:flex;flex-direction:column;align-items:flex-end;gap:.1rem}
+.hist-win{color:var(--call);font-size:.65rem;font-weight:700}
+.hist-loss{color:var(--put);font-size:.65rem;font-weight:700}
+.hist-be{color:var(--gold);font-size:.65rem;font-weight:700}
+.hist-pnl{font-family:var(--fm);font-size:.62rem;font-weight:700}
+.hist-ts{font-family:var(--fm);font-size:.52rem;color:var(--text3);text-align:right}
+.empty-state{display:flex;flex-direction:column;align-items:center;padding:2rem 1rem;color:var(--text3);gap:.7rem}
+.empty-icon{font-size:2rem}.empty-state p{font-size:.8rem;text-align:center;line-height:1.5}
+.empty-state-sm{padding:1rem;text-align:center;color:var(--text3);font-size:.76rem}
+#toast{position:fixed;bottom:5.5rem;left:50%;transform:translateX(-50%) translateY(12px);
+  background:var(--panel);border:1px solid var(--border);color:var(--text);padding:.65rem 1.1rem;
+  border-radius:12px;font-size:.83rem;font-family:var(--fu);box-shadow:0 8px 30px rgba(0,0,0,.5);
+  z-index:999;opacity:0;pointer-events:none;transition:opacity .3s,transform .3s;
+  white-space:nowrap;max-width:92vw;overflow:hidden;text-overflow:ellipsis}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+.bottom-nav{position:fixed;bottom:0;left:0;right:0;background:var(--bg2);border-top:1px solid var(--border);
+  padding:.45rem 0 .75rem;display:flex;justify-content:space-around;z-index:50}
+.nav-item{display:flex;flex-direction:column;align-items:center;gap:.18rem;color:var(--text3);
+  font-size:.62rem;font-weight:600;cursor:pointer;padding:.25rem .9rem;border-radius:8px}
+.nav-item.active{color:var(--accent)}.nav-icon{font-size:1.15rem}
+::-webkit-scrollbar{width:3px}::-webkit-scrollbar-track{background:var(--bg)}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
+</style>
+</head>
+<body>
+
+<div id="auth-screen">
+  <div class="auth-logo">BR TRADERS</div>
+  <div class="auth-sub">INTRADAY SIGNAL ENGINE &#xB7; NSE/BSE</div>
+  <div class="auth-card">
+    <input type="email"    id="email"    placeholder="Email address"  autocomplete="email"/>
+    <input type="password" id="password" placeholder="Password"       autocomplete="current-password"/>
+    <button class="auth-btn" onclick="handleLogin()">LOGIN / REGISTER</button>
+    <p class="auth-hint">New user? Account auto-created on first login.</p>
+    <div id="auth-error"></div>
+  </div>
+</div>
+
+<div id="app-screen">
+  <div class="app-header">
+    <div class="header-top">
+      <div class="brand">BR TRADERS</div>
+      <div class="header-right">
+        <div class="market-badge"><div class="market-dot"></div>LIVE</div>
+        <button class="logout-btn" onclick="handleLogout()">&#9211; Exit</button>
+      </div>
+    </div>
+    <div id="engine-status">&#8987; Connecting to AngelOne...</div>
+  </div>
+  <div class="app-scroll">
+    <div class="section-container">
+      <div class="section-header">
+        <span class="section-title">Active Trades</span>
+        <span class="section-badge badge-live">&#9679; LIVE</span>
+        <div class="section-line"></div>
+      </div>
+      <div id="active-trades">
+        <div class="empty-state">
+          <div class="empty-icon">&#128225;</div>
+          <p>Initializing AngelOne data feed...</p>
+        </div>
+      </div>
+    </div>
+    <div class="section-container">
+      <div class="section-header">
+        <span class="section-title">Today's Exits</span>
+        <span class="section-badge badge-today">TODAY</span>
+        <div class="section-line"></div>
+      </div>
+      <div id="today-exits"><div class="empty-state-sm">Loading...</div></div>
+    </div>
+    <div class="section-container">
+      <div class="section-header">
+        <span class="section-title">Trade History</span>
+        <span class="section-badge badge-hist">ARCHIVE</span>
+        <div class="section-line"></div>
+      </div>
+      <div id="history-list"><div class="empty-state-sm">Loading...</div></div>
+    </div>
+  </div>
+  <div class="bottom-nav">
+    <div class="nav-item active"><span class="nav-icon">&#128202;</span>Signals</div>
+    <div class="nav-item"><span class="nav-icon">&#128200;</span>Markets</div>
+    <div class="nav-item"><span class="nav-icon">&#127942;</span>Stats</div>
+    <div class="nav-item"><span class="nav-icon">&#9881;</span>Settings</div>
+  </div>
+</div>
+
+<div id="toast"></div>
+</body>
+</html>
